@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/private/tmp/claude-501/-Users-utsavpaliwal-Desktop-Projects-PR-Doctor/6a8a96bb-d3d9-441a-90d5-329043fcd48a/scratchpad/v/bin/python -c 'import greenlet; print\\('\\\\''greenlet'\\\\'', greenlet.__version__\\)')"
+    ]
+  }
+}

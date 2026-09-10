@@ -1,0 +1,38 @@
+# PRGuard — runtime dependencies
+#
+# Versions are exact pins, resolved and import-verified on Python 3.13 (2026-09-09).
+# Two extras below are load-bearing; see the comments before removing them.
+#
+# Install:  pip install -r requirements.txt
+# Dev too:  pip install -r requirements-dev.txt
+
+# --- API -----------------------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.4          # [standard] adds uvloop + httptools
+
+# --- queue / worker ------------------------------------------------------------
+celery==5.6.3
+redis==8.1.0                       # Celery broker + result backend
+
+# --- database ------------------------------------------------------------------
+# [asyncio] is REQUIRED, not cosmetic: plain `sqlalchemy` does not install greenlet,
+# and the async engine then raises only on the first real query, not at import.
+SQLAlchemy[asyncio]==2.0.52
+alembic==1.19.2
+psycopg[binary]==3.3.5             # psycopg 3 — drives postgresql+psycopg:// async
+
+# --- config / validation -------------------------------------------------------
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# --- LLM -----------------------------------------------------------------------
+anthropic==1.4.0                   # messages.parse() structured output + effort
+
+# --- GitHub --------------------------------------------------------------------
+httpx==0.28.1
+# [crypto] is REQUIRED: GitHub App JWTs are RS256, and bare PyJWT raises
+# NotImplementedError("Algorithm 'RS256' could not be found") at token-mint time.
+pyjwt[crypto]==2.13.0
+
+# --- logging -------------------------------------------------------------------
+structlog==26.1.0

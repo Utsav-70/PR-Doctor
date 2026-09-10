@@ -1,0 +1,93 @@
+# Development stack. `docker compose up` should reach all-healthy from a clean volume.
+#
+# api and worker wait on healthy datastores rather than just "started" — otherwise
+# both race Postgres's first-boot initdb and crash-loop on startup.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: prguard
+      POSTGRES_PASSWORD: prguard
+      POSTGRES_DB: prguard
+    ports:
+      # Host port is configurable so it cannot collide with a local Postgres.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prguard -d prguard"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build:
+      context: .
+      target: api
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://prguard:prguard@postgres:5432/prguard
+      REDIS_URL: redis://redis:6379/0
+      REDIS_RESULT_URL: redis://redis:6379/1
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Source mounted read-write so --reload works. Not mounted in production images.
+    volumes:
+      - .:/app
+    command:
+      - uvicorn
+      - apps.api.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/live').status==200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      target: worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://prguard:prguard@postgres:5432/prguard
+      REDIS_URL: redis://redis:6379/0
+      REDIS_RESULT_URL: redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A apps.worker.celery_app:celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  pgdata:

@@ -1,0 +1,12 @@
+# PRGuard — development dependencies
+#
+# Install:  pip install -r requirements.txt -r requirements-dev.txt
+#
+# Lint and type-check only. This project does not carry a test suite by choice;
+# correctness is verified by running the pipeline in DRY_RUN against real PRs
+# (see README → Verifying a change).
+
+-r requirements.txt
+
+ruff==0.16.6                       # lint + format
+mypy==2.3.1                        # static types

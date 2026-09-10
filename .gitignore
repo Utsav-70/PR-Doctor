@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+
+# Secrets — .env holds the GitHub App private key and the Anthropic key.
+# .env.example is committed; .env never is.
+.env
+*.pem
+
+# Local working data
+samples/**/.git/
+*.log

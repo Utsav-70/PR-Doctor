@@ -16,6 +16,7 @@ import jwt
 import redis.asyncio as aioredis
 
 from settings import get_settings
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +93,7 @@ async def _mint_installation_token(installation_id: int) -> tuple[str, int]:
 def _ttl_from_expiry(expires_at: str) -> int:
     if not expires_at:
         return 0
-    from datetime import datetime
-
+    
     expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     remaining = int(expiry.timestamp() - time.time()) - _EXPIRY_MARGIN_SECONDS
     return max(remaining, 0)

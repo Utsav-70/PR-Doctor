@@ -256,3 +256,45 @@ class ToolCall(Base):
     def __repr__(self) -> str:  # pragma: no cover
         verdict = "ok" if self.allowed and self.ok else (self.denied_reason or self.error)
         return f"<ToolCall {self.agent}/{self.tool} {verdict}>"
+
+
+class LlmCall(Base):
+    """One request to a model provider.
+
+    Separate from `reviews` because Phase 6 fans out to three agents and Phase 8 adds a
+    judge — a review will make many calls, and "which stage cost what" is the question
+    Phase 14 optimises against. Aggregating onto the review row first would lose exactly
+    the breakdown that makes the optimisation possible.
+    """
+
+    __tablename__ = "llm_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    review_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="CASCADE"), index=True
+    )
+
+    # Which pipeline step asked. One value in Phase 5; bug/security/performance/judge
+    # from Phase 6 onward.
+    stage: Mapped[str] = mapped_column(String(32), index=True)
+    provider: Mapped[str] = mapped_column(String(16))
+    model: Mapped[str] = mapped_column(String(64), index=True)
+
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), default=Decimal("0"))
+
+    # Recorded per call rather than derived: a refusal and a max_tokens truncation both
+    # return HTTP 200 with usable-looking output, and telling them apart afterwards is
+    # impossible without this.
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    tool_iterations: Mapped[int] = mapped_column(Integer, default=0)
+
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<LlmCall {self.stage} {self.model} ${self.cost_usd}>"

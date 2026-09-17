@@ -15,15 +15,16 @@ from typing import Any
 
 from sqlalchemy import delete, select, text
 
-from agent.context import build_context
-from agent.reviewer import review_diff
-from agent.schemas import SEVERITY_ORDER
-from agent.schemas import Finding as FindingSchema
+from agent.graph import UsageAccumulator, run_review_graph
+from agent.schemas import CallRecord
+from agent.tools.gateway import ToolGateway
+from agent.tools.workspace import PathNotAllowed, Workspace
 from apps.worker.celery_app import celery_app
-from db.models import Finding, Review, ReviewFile, ReviewStatus
+from db.models import Finding, LlmCall, Review, ReviewFile, ReviewStatus
 from db.session import session_scope
 from domain import PullRequestContext
 from github.analyze import build_pull_request_context
+from github.checkout import checkout
 from github.classify import looks_generated
 from github.client import GitHubClient, GitHubError
 from settings import get_settings
@@ -160,28 +161,12 @@ async def _run_pipeline(
             max_changed_lines=settings.MAX_CHANGED_LINES,
         )
 
-        file_contents: dict[str, str] = {}
-        for file in ctx.reviewed_files:
-            content = await gh.get_file_content(
-                owner, repo, file.path, expected_head_sha, max_bytes=settings.MAX_FILE_BYTES
-            )
-            if content is None:
-                # Unreadable, oversized, or binary — the classifier could not know
-                # that from the path alone.
-                file.reviewed = False
-                file.skip_reason = "content_unavailable"
-                continue
-            if looks_generated(content):
-                # The content sniff that no path pattern catches. Must run here
-                # rather than in the renderer, so the skip is recorded.
-                file.reviewed = False
-                file.skip_reason = "generated"
-                continue
-            file_contents[file.path] = content
-
-    await _persist_files(review_id, ctx)
+    # Phase 4 replaced the per-file HTTP fetch loop that used to sit here: the checkout
+    # below gives the tools a working tree, so reading a file is a filesystem call
+    # rather than one GitHub request each.
 
     if not ctx.reviewed_files:
+        await _persist_files(review_id, ctx)
         await _finish(
             review_id,
             ReviewStatus.SKIPPED,
@@ -193,22 +178,29 @@ async def _run_pipeline(
         )
         return {"status": "skipped", "reason": "nothing_reviewable"}
 
-    # --- build context ---------------------------------------------------------
-    bundle = build_context(
-        title=ctx.title,
-        description=ctx.description,
-        files=ctx.reviewed_files,
-        file_contents=file_contents,
-        max_chars=settings.MAX_CONTEXT_CHARS,
-    )
+    # --- checkout, investigate, review, validate (Phases 4 and 5) ---------------
+    # The tree is deleted when this block exits, on every path including failure. A
+    # leaked clone of a private repository is an incident.
+    async with checkout(
+        installation_id=installation_id, owner=owner, repo=repo, sha=expected_head_sha
+    ) as root:
+        workspace = Workspace.at(
+            root, repository_full_name=f"{owner}/{repo}", head_sha=expected_head_sha
+        )
+        _flag_generated_files(workspace, ctx)
+        await _persist_files(review_id, ctx)
 
-    # --- review ----------------------------------------------------------------
-    result = await review_diff(bundle.repository_block, bundle.diff_block)
+        gateway = ToolGateway(workspace, review_id=review_id)
+        state = await run_review_graph(review_id=review_id, pr=ctx, gateway=gateway)
 
-    # --- validate and persist --------------------------------------------------
-    line_maps = {f.path: f.diff_line_map for f in ctx.reviewed_files}
-    added_sets = {f.path: f.added_line_numbers for f in ctx.reviewed_files}
-    kept, dropped = _validate(result.report.findings, line_maps, added_sets)
+    kept = state.get("findings", [])
+    dropped = [(d.finding, d.reason) for d in state.get("dropped", [])]
+    usage = state.get("usage") or UsageAccumulator()
+    errors = state.get("errors", [])
+    bundle = state.get("context_bundle")
+    truncated = bool(bundle and bundle.truncated)
+
+    await _persist_llm_calls(review_id, usage.calls)
 
     async with session_scope() as session:
         review = (await session.execute(select(Review).where(Review.id == review_id))).scalar_one()
@@ -217,20 +209,23 @@ async def _run_pipeline(
         review.changed_files = ctx.changed_files
         review.added_lines = ctx.added_lines
         review.deleted_lines = ctx.deleted_lines
-        review.is_partial = ctx.is_partial or bundle.truncated
-        review.partial_reason = ctx.partial_reason or (
-            "context_truncated" if bundle.truncated else None
-        )
+        review.is_partial = ctx.is_partial or truncated
+        review.partial_reason = ctx.partial_reason or ("context_truncated" if truncated else None)
         review.raw_diff = raw_diff[: settings.MAX_DIFF_STORE_BYTES]
-        review.input_tokens = result.usage.input_tokens
-        review.output_tokens = result.usage.output_tokens
-        review.cache_read_tokens = result.usage.cache_read_tokens
-        review.cache_creation_tokens = result.usage.cache_creation_tokens
-        review.cost_usd = Decimal(str(round(result.usage.cost_usd, 6)))
+        review.input_tokens = usage.input_tokens
+        review.output_tokens = usage.output_tokens
+        review.cache_read_tokens = usage.cache_read_tokens
+        review.cache_creation_tokens = usage.cache_creation_tokens
+        review.cost_usd = Decimal(str(round(usage.cost_usd, 6)))
         review.status = ReviewStatus.PARTIAL if review.is_partial else ReviewStatus.COMPLETED
         review.finished_at = datetime.now(UTC)
-        if result.refused:
-            review.error = {"type": "refusal", "stage": "reviewer"}
+        if errors:
+            # Degraded stages, not a failed review. Recorded so "why were there no
+            # findings" has an answer that is not guesswork.
+            review.error = {
+                "type": "degraded",
+                "stages": [{"stage": e.stage, "kind": e.kind, "detail": e.detail} for e in errors],
+            }
 
         for finding, position in kept:
             session.add(
@@ -270,14 +265,19 @@ async def _run_pipeline(
             "review_id": str(review_id),
             "kept": len(kept),
             "dropped": len(dropped),
-            "cost_usd": round(result.usage.cost_usd, 4),
+            "llm_calls": len(usage.calls),
+            "tool_calls": gateway.usage.calls,
+            "tool_iterations": state.get("tool_iterations", 0),
+            "cost_usd": round(usage.cost_usd, 4),
         },
     )
     return {
         "status": "completed",
         "findings": len(kept),
         "dropped": len(dropped),
-        "cost_usd": round(result.usage.cost_usd, 6),
+        "llm_calls": len(usage.calls),
+        "tool_calls": gateway.usage.calls,
+        "cost_usd": round(usage.cost_usd, 6),
     }
 
 
@@ -311,42 +311,62 @@ async def _persist_files(review_id: uuid.UUID, ctx: PullRequestContext) -> None:
             )
 
 
-def _validate(
-    findings: list[FindingSchema],
-    line_maps: dict[str, dict[int, int]],
-    added_lines: dict[str, set[int]],
-) -> tuple[list[tuple[FindingSchema, int]], list[tuple[FindingSchema, str]]]:
-    """Drop findings that cannot be anchored to a changed line.
+def _flag_generated_files(workspace: Workspace, ctx: PullRequestContext) -> None:
+    """Content-sniff for generated files, now that a working tree exists.
 
-    Structured output guarantees the shape; it guarantees nothing about whether the
-    cited line exists or belongs to this PR. A confident observation about a line
-    nobody touched is the most common way an LLM reviewer looks broken.
+    Runs against the checkout rather than an HTTP fetch, and marks the skip on the
+    context so it lands in `review_files` — a file excluded for having an `@generated`
+    header should be as visible as one excluded by an ignore glob.
     """
-    kept: list[tuple[FindingSchema, int]] = []
-    dropped: list[tuple[FindingSchema, str]] = []
-    seen: set[tuple[str, int, str]] = set()
+    for file in ctx.reviewed_files:
+        try:
+            target = workspace.resolve(file.path)
+        except PathNotAllowed:
+            file.reviewed = False
+            file.skip_reason = "path_not_allowed"
+            continue
+        if not target.is_file():
+            file.reviewed = False
+            file.skip_reason = "missing_at_head"
+            continue
+        try:
+            head = target.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            file.reviewed = False
+            file.skip_reason = "content_unavailable"
+            continue
+        if looks_generated(head):
+            file.reviewed = False
+            file.skip_reason = "generated"
 
-    for finding in sorted(
-        findings, key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), -f.confidence)
-    ):
-        if finding.file not in line_maps:
-            dropped.append((finding, "unknown_file"))
-            continue
-        position = line_maps[finding.file].get(finding.line)
-        if position is None:
-            dropped.append((finding, "outside_diff"))
-            continue
-        if finding.line not in added_lines.get(finding.file, set()):
-            dropped.append((finding, "unchanged_line"))
-            continue
-        key = (finding.file, finding.line, finding.category)
-        if key in seen:
-            dropped.append((finding, "duplicate"))
-            continue
-        seen.add(key)
-        kept.append((finding, position))
 
-    return kept, dropped
+async def _persist_llm_calls(review_id: uuid.UUID, calls: list[CallRecord]) -> None:
+    """One row per provider request.
+
+    Written before the review row is finalised, so a failure between the two still
+    leaves the spend on record. Cost you cannot see is cost you cannot control.
+    """
+    if not calls:
+        return
+    async with session_scope() as session:
+        for call in calls:
+            session.add(
+                LlmCall(
+                    review_id=review_id,
+                    stage=call.stage[:32],
+                    provider=call.provider[:16],
+                    model=call.model[:64],
+                    input_tokens=call.input_tokens,
+                    output_tokens=call.output_tokens,
+                    cache_read_tokens=call.cache_read_tokens,
+                    cache_creation_tokens=call.cache_creation_tokens,
+                    cost_usd=Decimal(str(round(call.cost_usd, 6))),
+                    stop_reason=call.stop_reason[:32] if call.stop_reason else None,
+                    duration_ms=call.duration_ms,
+                    tool_iterations=call.tool_iterations,
+                    error=call.error[:512] if call.error else None,
+                )
+            )
 
 
 async def _finish(

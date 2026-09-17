@@ -57,6 +57,17 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SECONDS: float = 600.0
     LLM_MAX_RETRIES: int = 2
 
+    # --- Phase 5 budgets ------------------------------------------------------
+    # Enforced as the calls happen, not tallied afterwards. A runaway agent that is
+    # only noticed at the end has already spent the money.
+    MAX_LLM_CALLS_PER_REVIEW: int = 25
+    MAX_COST_PER_REVIEW_USD: float = 1.50
+    MAX_TOOL_ITERATIONS: int = 12
+
+    # Run the whole pipeline, record everything, post nothing. The only safe way to
+    # evaluate a prompt or threshold change against live traffic.
+    DRY_RUN: bool = False
+
     # --- budgets ------------------------------------------------------------
     MAX_CHANGED_LINES: int = 3000
     MAX_CHANGED_FILES: int = 50

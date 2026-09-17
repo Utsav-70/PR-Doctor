@@ -12,9 +12,12 @@ provider rots silently, whereas both of these are type-checked on every CI run.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
+from typing import Any
 
-from agent.schemas import FindingsReport, ReviewResult, ReviewUsage
+from agent.schemas import CallRecord, FindingsReport, ReviewResult, ReviewUsage
+from agent.tools.gateway import ToolGateway
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -87,15 +90,56 @@ def estimate_cost(
     return total / 1_000_000
 
 
-async def review_diff(repository_block: str, diff_block: str) -> ReviewResult:
-    """Run one review pass and return validated findings plus usage."""
-    provider = get_settings().LLM_PROVIDER
-    if provider == "gemini":
-        return await _review_gemini(repository_block, diff_block)
-    return await _review_anthropic(repository_block, diff_block)
+async def review_diff(
+    repository_block: str,
+    diff_block: str,
+    *,
+    gateway: ToolGateway | None = None,
+    agent: str = "reviewer",
+) -> ReviewResult:
+    """Investigate (if tools are available), then report.
+
+    Without a gateway this is the Phase 3 behaviour: one call over whatever context was
+    assembled up front. With one, the agent explores the repository first and the
+    reporting call sees what it found — which is the difference between a reviewer that
+    pattern-matches and one that checks.
+    """
+    settings = get_settings()
+
+    investigation = None
+    if gateway is not None:
+        from agent.investigate import investigate
+
+        investigation = await investigate(
+            gateway=gateway,
+            system_prompt=load_prompt(),
+            repository_block=repository_block,
+            diff_block=diff_block,
+            agent=agent,
+        )
+
+    transcript = investigation.transcript if investigation else ""
+    if settings.LLM_PROVIDER == "gemini":
+        result = await _review_gemini(repository_block, diff_block, transcript)
+    else:
+        result = await _review_anthropic(repository_block, diff_block, transcript)
+
+    if investigation is not None:
+        # Investigation calls come first so `llm_calls` reads in execution order.
+        result.calls = [*investigation.calls, *result.calls]
+        result.tool_iterations = investigation.iterations
+        result.budget_stopped = investigation.stopped_by
+        result.usage.input_tokens += sum(c.input_tokens for c in investigation.calls)
+        result.usage.output_tokens += sum(c.output_tokens for c in investigation.calls)
+        result.usage.cache_read_tokens += sum(c.cache_read_tokens for c in investigation.calls)
+        result.usage.cost_usd += investigation.cost_usd
+
+    return result
 
 
-async def _review_anthropic(repository_block: str, diff_block: str) -> ReviewResult:
+async def _review_anthropic(
+    repository_block: str, diff_block: str, transcript: str = ""
+) -> ReviewResult:
     """Claude via the Anthropic SDK.
 
     The prompt-cache layout is deliberate and set up now because it is expensive to
@@ -112,6 +156,9 @@ async def _review_anthropic(repository_block: str, diff_block: str) -> ReviewRes
         max_retries=settings.LLM_MAX_RETRIES,
     )
 
+    tail: list[Any] = [{"type": "text", "text": transcript}] if transcript else []
+
+    started = time.perf_counter()
     try:
         response = await client.messages.parse(
             model=settings.LLM_MODEL,
@@ -138,7 +185,10 @@ async def _review_anthropic(repository_block: str, diff_block: str) -> ReviewRes
                             "cache_control": {"type": "ephemeral"},
                         },
                         # Uncached tail — varies per call, so it must come last.
+                        # The investigation transcript belongs here too: it differs on
+                        # every review and would poison the cached prefix.
                         {"type": "text", "text": diff_block},
+                        *tail,
                     ],
                 }
             ],
@@ -160,23 +210,28 @@ async def _review_anthropic(repository_block: str, diff_block: str) -> ReviewRes
         usage.cache_read_tokens,
         usage.cache_creation_tokens,
     )
+    record = _record("anthropic", settings.LLM_MODEL, usage, started)
 
     # Check stop_reason before touching output. A refusal is HTTP 200 with empty or
     # partial content, so reading parsed_output first would raise in production and
     # never in development.
     if response.stop_reason == "refusal":
         logger.warning("reviewer refused", extra={"details": str(response.stop_details)})
-        return ReviewResult(report=FindingsReport(findings=[]), usage=usage, refused=True)
+        return ReviewResult(
+            report=FindingsReport(findings=[]), usage=usage, refused=True, calls=[record]
+        )
 
     if response.stop_reason == "max_tokens":
         logger.warning("reviewer hit max_tokens; findings may be truncated")
 
     report = response.parsed_output or FindingsReport(findings=[])
     _log_complete(report, usage)
-    return ReviewResult(report=report, usage=usage)
+    return ReviewResult(report=report, usage=usage, calls=[record])
 
 
-async def _review_gemini(repository_block: str, diff_block: str) -> ReviewResult:
+async def _review_gemini(
+    repository_block: str, diff_block: str, transcript: str = ""
+) -> ReviewResult:
     """Gemini via google-genai.
 
     No explicit cache breakpoints: Gemini caches repeated prefixes implicitly, so the
@@ -192,9 +247,10 @@ async def _review_gemini(repository_block: str, diff_block: str) -> ReviewResult
         http_options=types.HttpOptions(timeout=int(settings.LLM_TIMEOUT_SECONDS * 1000)),
     )
 
+    started = time.perf_counter()
     response = await client.aio.models.generate_content(
         model=settings.LLM_MODEL,
-        contents=[repository_block, diff_block],
+        contents=[repository_block, diff_block, *([transcript] if transcript else [])],
         config=types.GenerateContentConfig(
             system_instruction=load_prompt(),
             max_output_tokens=settings.LLM_MAX_TOKENS,
@@ -232,12 +288,15 @@ async def _review_gemini(repository_block: str, diff_block: str) -> ReviewResult
         usage.cache_creation_tokens,
         cache_read_multiplier=0.25,
     )
+    record = _record("gemini", settings.LLM_MODEL, usage, started)
 
     # Same ordering rule as the Anthropic path: a blocked response is a 200 with no
     # usable content, so the finish reason is checked before `parsed` is touched.
     if finish_name in _GEMINI_REFUSAL_REASONS:
         logger.warning("reviewer refused", extra={"finish_reason": finish_name})
-        return ReviewResult(report=FindingsReport(findings=[]), usage=usage, refused=True)
+        return ReviewResult(
+            report=FindingsReport(findings=[]), usage=usage, refused=True, calls=[record]
+        )
 
     if finish_name == "MAX_TOKENS":
         logger.warning("reviewer hit max_tokens; findings may be truncated")
@@ -247,7 +306,23 @@ async def _review_gemini(repository_block: str, diff_block: str) -> ReviewResult
     if parsed is not None and not isinstance(parsed, FindingsReport):
         logger.warning("unexpected parsed type %s; treating as empty", type(parsed).__name__)
     _log_complete(report, usage)
-    return ReviewResult(report=report, usage=usage)
+    return ReviewResult(report=report, usage=usage, calls=[record])
+
+
+def _record(provider: str, model: str, usage: ReviewUsage, started: float) -> CallRecord:
+    """The reporting call, as an `llm_calls` row."""
+    return CallRecord(
+        stage="report",
+        provider=provider,
+        model=model,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+        cache_creation_tokens=usage.cache_creation_tokens,
+        cost_usd=usage.cost_usd,
+        stop_reason=usage.stop_reason,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
 
 
 def _log_complete(report: FindingsReport, usage: ReviewUsage) -> None:

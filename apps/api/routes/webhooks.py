@@ -16,12 +16,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.worker.celery_app import celery_app
 from db.session import get_sessionmaker
 from github.webhooks import PullRequestEvent, parse_pull_request_event, verify_signature
 from settings import get_settings
-
-from apps.worker.celery_app import celery_app
-
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["webhooks"])
@@ -155,7 +153,7 @@ def _enqueue(review_id: uuid.UUID) -> None:
     Only the ID travels — not the payload. The worker reads current state from
     Postgres, so a retry after a code change does not replay a stale snapshot.
     """
-    
+
     celery_app.send_task(
         "review.pull_request",
         args=[str(review_id)],

@@ -13,17 +13,19 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 
-from agent.context import build_context, is_ignored, is_source
+from agent.context import build_context
 from agent.reviewer import review_diff
 from agent.schemas import SEVERITY_ORDER
 from agent.schemas import Finding as FindingSchema
 from apps.worker.celery_app import celery_app
-from db.models import Finding, Review, ReviewStatus
+from db.models import Finding, Review, ReviewFile, ReviewStatus
 from db.session import session_scope
+from domain import PullRequestContext
+from github.analyze import build_pull_request_context
+from github.classify import looks_generated
 from github.client import GitHubClient, GitHubError
-from github.diff import FileDiff, parse_files
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -120,45 +122,55 @@ async def _run_pipeline(
         )
         raw_diff = await gh.get_diff(owner, repo, pr_number)
 
-        diffs = parse_files(files_payload)
-        reviewable = _select_reviewable(diffs, settings.ignore_globs)
+        # --- analyse (Phase 3) -------------------------------------------------
+        # Deterministic and network-free; everything below this line operates on the
+        # context rather than on raw API payloads.
+        ctx = build_pull_request_context(
+            pr=pr,
+            files_payload=files_payload,
+            repository_full_name=f"{owner}/{repo}",
+            ignore_globs=settings.ignore_globs,
+            max_changed_lines=settings.MAX_CHANGED_LINES,
+        )
 
         file_contents: dict[str, str] = {}
-        for diff in reviewable:
+        for file in ctx.reviewed_files:
             content = await gh.get_file_content(
-                owner, repo, diff.path, expected_head_sha, max_bytes=settings.MAX_FILE_BYTES
+                owner, repo, file.path, expected_head_sha, max_bytes=settings.MAX_FILE_BYTES
             )
-            if content is not None:
-                file_contents[diff.path] = content
+            if content is None:
+                # Unreadable, oversized, or binary — the classifier could not know
+                # that from the path alone.
+                file.reviewed = False
+                file.skip_reason = "content_unavailable"
+                continue
+            if looks_generated(content):
+                # The content sniff that no path pattern catches. Must run here
+                # rather than in the renderer, so the skip is recorded.
+                file.reviewed = False
+                file.skip_reason = "generated"
+                continue
+            file_contents[file.path] = content
 
-    added = sum(d.additions for d in diffs)
-    deleted = sum(d.deletions for d in diffs)
-    changed_lines = sum(d.additions + d.deletions for d in reviewable)
+    await _persist_files(review_id, ctx)
 
-    is_partial = False
-    partial_reason: str | None = None
-    if changed_lines > settings.MAX_CHANGED_LINES:
-        is_partial = True
-        partial_reason = "diff_too_large"
-        reviewable = _trim_to_budget(reviewable, settings.MAX_CHANGED_LINES)
-
-    if not reviewable:
+    if not ctx.reviewed_files:
         await _finish(
             review_id,
             ReviewStatus.SKIPPED,
             partial_reason="nothing_reviewable",
-            changed_files=len(diffs),
-            added_lines=added,
-            deleted_lines=deleted,
+            changed_files=ctx.changed_files,
+            added_lines=ctx.added_lines,
+            deleted_lines=ctx.deleted_lines,
             raw_diff=raw_diff[: settings.MAX_DIFF_STORE_BYTES],
         )
         return {"status": "skipped", "reason": "nothing_reviewable"}
 
     # --- build context ---------------------------------------------------------
     bundle = build_context(
-        title=str(pr.get("title") or ""),
-        description=str(pr.get("body") or ""),
-        files=reviewable,
+        title=ctx.title,
+        description=ctx.description,
+        files=ctx.reviewed_files,
         file_contents=file_contents,
         max_chars=settings.MAX_CONTEXT_CHARS,
     )
@@ -167,19 +179,19 @@ async def _run_pipeline(
     result = await review_diff(bundle.repository_block, bundle.diff_block)
 
     # --- validate and persist --------------------------------------------------
-    line_maps = {d.path: d.line_map for d in reviewable}
-    added_sets = {d.path: d.added_lines for d in reviewable}
+    line_maps = {f.path: f.diff_line_map for f in ctx.reviewed_files}
+    added_sets = {f.path: f.added_line_numbers for f in ctx.reviewed_files}
     kept, dropped = _validate(result.report.findings, line_maps, added_sets)
 
     async with session_scope() as session:
         review = (await session.execute(select(Review).where(Review.id == review_id))).scalar_one()
-        review.title = str(pr.get("title") or "")[:1000]
-        review.description = str(pr.get("body") or "")[:20000]
-        review.changed_files = len(diffs)
-        review.added_lines = added
-        review.deleted_lines = deleted
-        review.is_partial = is_partial or bundle.truncated
-        review.partial_reason = partial_reason or (
+        review.title = ctx.title[:1000]
+        review.description = ctx.description[:20000]
+        review.changed_files = ctx.changed_files
+        review.added_lines = ctx.added_lines
+        review.deleted_lines = ctx.deleted_lines
+        review.is_partial = ctx.is_partial or bundle.truncated
+        review.partial_reason = ctx.partial_reason or (
             "context_truncated" if bundle.truncated else None
         )
         review.raw_diff = raw_diff[: settings.MAX_DIFF_STORE_BYTES]
@@ -242,25 +254,34 @@ async def _run_pipeline(
     }
 
 
-def _select_reviewable(diffs: list[FileDiff], ignore_globs: list[str]) -> list[FileDiff]:
-    return [
-        d
-        for d in diffs
-        if d.is_reviewable and is_source(d.path) and not is_ignored(d.path, ignore_globs)
-    ]
+async def _persist_files(review_id: uuid.UUID, ctx: PullRequestContext) -> None:
+    """Write one row per changed file, replacing any from an earlier attempt.
 
-
-def _trim_to_budget(diffs: list[FileDiff], budget: int) -> list[FileDiff]:
-    """Keep the smallest files first — more files reviewed per token spent."""
-    kept: list[FileDiff] = []
-    spent = 0
-    for diff in sorted(diffs, key=lambda d: d.additions + d.deletions):
-        cost = diff.additions + diff.deletions
-        if spent + cost > budget:
-            continue
-        kept.append(diff)
-        spent += cost
-    return kept
+    Written before the LLM call, not after: if the review then fails, the analysis is
+    still on record and answers "what did it decide to look at, and why" without a
+    re-fetch. Delete-then-insert rather than upsert — a retry re-analyses the whole
+    commit, so a file that vanished from the payload should vanish from the table.
+    """
+    async with session_scope() as session:
+        await session.execute(delete(ReviewFile).where(ReviewFile.review_id == review_id))
+        for file in ctx.files:
+            session.add(
+                ReviewFile(
+                    review_id=review_id,
+                    path=file.path[:1024],
+                    previous_path=file.previous_path[:1024] if file.previous_path else None,
+                    change_type=file.change_type,
+                    language=file.language,
+                    category=file.category,
+                    added_lines=file.additions,
+                    deleted_lines=file.deletions,
+                    patch=file.patch,
+                    # JSONB keys are strings; the model re-reads them as ints.
+                    diff_line_map={str(k): v for k, v in file.diff_line_map.items()},
+                    reviewed=file.reviewed,
+                    skip_reason=file.skip_reason,
+                )
+            )
 
 
 def _validate(

@@ -37,15 +37,26 @@ PRICING: dict[str, tuple[float, float]] = {
 
 _DEFAULT_PRICE = (5.00, 25.00)
 
-# LLM_EFFORT is Anthropic's vocabulary. Gemini expresses the same idea as a coarser
-# ThinkingLevel, so the top three collapse to HIGH.
-_GEMINI_THINKING_LEVEL: dict[str, str] = {
-    "low": "LOW",
-    "medium": "MEDIUM",
-    "high": "HIGH",
-    "xhigh": "HIGH",
-    "max": "HIGH",
+# LLM_EFFORT is Anthropic's vocabulary. Gemini 2.5 expresses the same idea as a token
+# allowance for reasoning. (`thinking_level` exists in the SDK but the 2.5 models reject
+# it with 400 INVALID_ARGUMENT — it is for later model generations.)
+_GEMINI_THINKING_BUDGET: dict[str, int] = {
+    "low": 2048,
+    "medium": 8192,
+    "high": 16384,
+    "xhigh": 24576,
+    "max": 32768,
 }
+
+# Pro accepts up to 32768; Flash caps at 24576 and 400s above it.
+_GEMINI_FLASH_MAX_THINKING = 24576
+
+
+def _gemini_thinking_budget(model: str, effort: str) -> int:
+    budget = _GEMINI_THINKING_BUDGET[effort]
+    if "flash" in model:
+        return min(budget, _GEMINI_FLASH_MAX_THINKING)
+    return budget
 
 # finish_reason values that mean "the model declined", not "the model answered".
 _GEMINI_REFUSAL_REASONS = frozenset(
@@ -192,7 +203,7 @@ async def _review_gemini(repository_block: str, diff_block: str) -> ReviewResult
             # with the Anthropic path rather than being hand-written as JSON Schema.
             response_schema=FindingsReport,
             thinking_config=types.ThinkingConfig(
-                thinking_level=_GEMINI_THINKING_LEVEL[settings.LLM_EFFORT],
+                thinking_budget=_gemini_thinking_budget(settings.LLM_MODEL, settings.LLM_EFFORT),
             ),
         ),
     )

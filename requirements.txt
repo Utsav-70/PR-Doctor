@@ -22,6 +22,10 @@ alembic==1.19.2
 psycopg[binary]==3.3.5             # psycopg 3 — drives postgresql+psycopg:// async
 
 # --- config / validation -------------------------------------------------------
+# gitignore semantics for ignore globs. fnmatch cannot express them: it treats
+# `**/migrations/**` as requiring a leading directory, so a top-level `migrations/`
+# escaped the ignore list entirely.
+pathspec==1.1.1
 pydantic==2.13.5
 pydantic-settings==2.15.0
 

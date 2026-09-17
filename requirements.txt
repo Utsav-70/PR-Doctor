@@ -26,7 +26,10 @@ pydantic==2.13.5
 pydantic-settings==2.15.0
 
 # --- LLM -----------------------------------------------------------------------
+# Both providers ship; LLM_PROVIDER picks one at runtime. Imports are function-local
+# in agent/reviewer.py, so the unused SDK is never loaded.
 anthropic==1.4.0                   # messages.parse() structured output + effort
+google-genai==2.23.0               # Gemini fallback provider
 
 # --- GitHub --------------------------------------------------------------------
 httpx==0.28.1

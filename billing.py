@@ -7,5 +7,7 @@ def find_order(conn: sqlite3.Connection, order_id: str):
     return cur.fetchone()
 
 
+
+
 def apply_discount(total: float, percent: float) -> float:
     return total - total * percent

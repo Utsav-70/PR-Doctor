@@ -47,6 +47,21 @@ async def _ping() -> dict[str, Any]:
     name="review.pull_request",
     bind=True,
     acks_late=True,
+    # KNOWN GAP (Phase 13 — Reliability): these three do nothing today.
+    #
+    # Celery applies `max_retries` / `retry_backoff` only when a task calls
+    # `self.retry()` or declares `autoretry_for=(...)`. This task does neither, so an
+    # exception propagates, the task is marked FAILURE, and no second attempt happens.
+    # The settings read as if retries are on. They are not.
+    #
+    # The fix is NOT `autoretry_for=(Exception,)` — phase-13-reliability.md lists that
+    # under Risks: it retries bugs and wastes a full paid review per failure. What is
+    # needed is the classified list that phase specifies: retry transient failures
+    # (5xx, timeouts, secondary rate limits), never retry 404s, refusals, or primary
+    # rate limits whose reset is an hour out.
+    #
+    # Left inert deliberately rather than removed: the parameters are the ones Phase 13
+    # will use, and deleting them would hide that the decision is outstanding.
     max_retries=2,
     retry_backoff=True,
     retry_backoff_max=300,
@@ -65,12 +80,24 @@ async def _review(review_id: uuid.UUID) -> dict[str, Any]:
             logger.error("review not found", extra={"review_id": str(review_id)})
             return {"status": "missing"}
         # Commit `running` in its own transaction so a hung task is visible.
+        # `running` -> `running` is legal here: acks_late means a worker killed
+        # mid-review has its message redelivered, and the row is still RUNNING when
+        # the replacement picks it up. The attempt counter is what distinguishes
+        # "in progress" from "in progress for the third time".
         review.status = ReviewStatus.RUNNING
+        review.attempt += 1
         review.started_at = datetime.now(UTC)
+        attempt = review.attempt
         owner, repo_name = review.repository_full_name.split("/", 1)
         installation_id = review.installation_id
         pr_number = review.pr_number
         head_sha = review.head_sha
+
+    if attempt > 1:
+        logger.warning(
+            "review retried",
+            extra={"review_id": str(review_id), "attempt": attempt},
+        )
 
     try:
         outcome = await _run_pipeline(
@@ -352,4 +379,10 @@ async def _fail(review_id: uuid.UUID, error_type: str, message: str) -> None:
         review = (await session.execute(select(Review).where(Review.id == review_id))).scalar_one()
         review.status = ReviewStatus.FAILED
         review.finished_at = datetime.now(UTC)
-        review.error = {"type": error_type, "message": message[:2000]}
+        # The attempt is recorded so a failure that only appears on retry — a stale
+        # token, a superseded SHA — is distinguishable from one that failed outright.
+        review.error = {
+            "type": error_type,
+            "message": message[:2000],
+            "attempt": review.attempt,
+        }

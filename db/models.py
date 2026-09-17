@@ -217,3 +217,42 @@ class ReviewFile(Base):
     def __repr__(self) -> str:  # pragma: no cover
         flag = "reviewed" if self.reviewed else f"skipped:{self.skip_reason}"
         return f"<ReviewFile {self.path} {self.language}/{self.category} {flag}>"
+
+
+class ToolCall(Base):
+    """One tool invocation, including the denied ones.
+
+    This is the answer to "why did it say that" in Phase 15. Denials matter most:
+    `allowed = false` rows are how an over-broad permission set becomes visible now,
+    while the tools only read — rather than in Phase 11, when they can execute.
+    """
+
+    __tablename__ = "tool_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    review_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="CASCADE"), index=True
+    )
+
+    # Which agent asked. One name in Phase 5; bug/security/performance from Phase 6.
+    agent: Mapped[str] = mapped_column(String(32), index=True)
+    tool: Mapped[str] = mapped_column(String(32), index=True)
+    # Arguments as received. Model-supplied and therefore evidence: a path traversal
+    # attempt is only diagnosable if the rejected argument was recorded.
+    args: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+    allowed: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    denied_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    result_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    result_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self) -> str:  # pragma: no cover
+        verdict = "ok" if self.allowed and self.ok else (self.denied_reason or self.error)
+        return f"<ToolCall {self.agent}/{self.tool} {verdict}>"

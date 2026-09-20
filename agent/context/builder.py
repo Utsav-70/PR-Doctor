@@ -50,11 +50,22 @@ _DEFINITION = re.compile(r"^\+\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)")
 # an edit inside a body is the common case, far more common than adding a new `def`.
 _HUNK_ENCLOSING = re.compile(r"^@@[^@]*@@\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)")
 
-# Per-file caps. The gateway allows 60 tool calls per review; without these a single
-# 200-line diff would spend the whole budget on one file.
+# Share of the review's tool budget this builder may spend. The rest is reserved for
+# the agent's own investigation.
+#
+# Fixed per-file caps were wrong: at 7 calls per file they exhausted a 60-call budget
+# after nine files, and a 27-file PR attempted 190 calls in about a second — leaving
+# the agent nothing to investigate with, on a review that then ran for another two
+# and a half minutes. The builder is bounded and predictable; the agent is adaptive
+# and is the reason the tools exist. The adaptive one gets the guaranteed share.
+CONTEXT_BUILDER_BUDGET_SHARE = 0.4
+
+# Ceilings per file, applied only when the file count leaves room for them.
 MAX_SYMBOLS_PER_FILE = 4
 MAX_REFERENCE_SYMBOLS_PER_FILE = 2
 MAX_REFERENCES_PER_SYMBOL = 8
+# Calls a single file consumes at full allowance: symbols + references + one get_tests.
+_CALLS_PER_FILE_AT_MAX = MAX_SYMBOLS_PER_FILE + MAX_REFERENCE_SYMBOLS_PER_FILE + 1
 
 
 @dataclass
@@ -72,6 +83,10 @@ class BuildReport:
     trimmed_sections: list[str] = field(default_factory=list)
     tool_calls: int = 0
     denied_calls: int = 0
+    # Files the budget could not reach at all. Distinct from a trimmed section: those
+    # were gathered and dropped, these were never looked at.
+    files_skipped_for_budget: int = 0
+    calls_per_file: int = 0
 
 
 def _candidate_symbols(file: PullRequestFile) -> tuple[list[str], list[str]]:
@@ -123,26 +138,45 @@ async def build_tool_context(
     files = sorted(pr.reviewed_files, key=lambda f: f.path)
     report.files = len(files)
 
+    # Spend at most our share, and divide it evenly so the last file gets the same
+    # attention as the first. Sorting by path already makes that order arbitrary —
+    # letting early files consume everything would be arbitrary *and* invisible.
+    allowance = max(int(gateway.max_calls * CONTEXT_BUILDER_BUDGET_SHARE), 1)
+    per_file = min(_CALLS_PER_FILE_AT_MAX, max(allowance // max(len(files), 1), 1))
+    report.calls_per_file = per_file
+    spent = 0
+
     definitions: dict[str, list[Symbol]] = {}
     references: dict[str, list[Reference]] = {}
     tests: dict[str, list[TestHit]] = {}
 
-    for file in files:
-        wanted, defined = _candidate_symbols(file)
+    for index, file in enumerate(files):
+        if spent >= allowance:
+            report.files_skipped_for_budget = len(files) - index
+            break
 
-        for name in wanted:
+        wanted, defined = _candidate_symbols(file)
+        # get_tests is the cheapest signal per call, so it is never the thing dropped.
+        budget = per_file
+        symbol_slots = max(budget - 2, 0)
+        reference_slots = max(min(budget - symbol_slots - 1, MAX_REFERENCE_SYMBOLS_PER_FILE), 0)
+
+        for name in wanted[:symbol_slots]:
             result = await gateway.call(agent, "get_symbol", {"name": name})
+            spent += 1
             if result.ok and result.data["symbols"]:
                 definitions.setdefault(name, []).extend(result.data["symbols"])
 
-        for name in defined:
+        for name in defined[:reference_slots]:
             result = await gateway.call(
                 agent, "find_references", {"name": name, "max_results": MAX_REFERENCES_PER_SYMBOL}
             )
+            spent += 1
             if result.ok and result.data["references"]:
                 references.setdefault(name, []).extend(result.data["references"])
 
         result = await gateway.call(agent, "get_tests", {"path": file.path})
+        spent += 1
         if result.ok and result.data["tests"]:
             tests.setdefault(file.path, []).extend(result.data["tests"])
 
@@ -171,8 +205,15 @@ async def build_tool_context(
         kept.append(rendered)
         budget -= len(rendered)
 
-    if report.trimmed_sections:
-        logger.info("context trimmed", extra={"sections": report.trimmed_sections})
+    if report.trimmed_sections or report.files_skipped_for_budget:
+        logger.info(
+            "context reduced",
+            extra={
+                "trimmed_sections": report.trimmed_sections,
+                "files_skipped_for_budget": report.files_skipped_for_budget,
+                "calls_per_file": report.calls_per_file,
+            },
+        )
 
     repository_block = "\n".join(
         ['<repository_content untrusted="true">', *kept, "</repository_content>"]

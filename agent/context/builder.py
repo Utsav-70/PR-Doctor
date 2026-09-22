@@ -26,6 +26,7 @@ import keyword
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from agent.context.render import ContextBundle, neutralise
 from agent.tools.gateway import ToolGateway
@@ -126,6 +127,28 @@ def _candidate_symbols(file: PullRequestFile) -> tuple[list[str], list[str]]:
     return ordered[:MAX_SYMBOLS_PER_FILE], defined[:MAX_REFERENCE_SYMBOLS_PER_FILE]
 
 
+def _call_plan(file: PullRequestFile) -> list[tuple[str, dict[str, Any]]]:
+    """This file's tool calls, most valuable first, so a small budget buys the best ones.
+
+    Order matters because the budget truncates this list. A changed signature breaks
+    callers the diff never shows, so `find_references` on what the file defines leads;
+    then the definition of what the new code leans on; then coverage; then depth.
+
+    `get_tests` used to be unconditional on the grounds that it is the cheapest call —
+    which confused cheap with useful. At one call per file that spent the entire budget
+    on coverage and read no code at all.
+    """
+    wanted, defined = _candidate_symbols(file)
+    refs: list[tuple[str, dict[str, Any]]] = [
+        ("find_references", {"name": n, "max_results": MAX_REFERENCES_PER_SYMBOL})
+        for n in defined[:MAX_REFERENCE_SYMBOLS_PER_FILE]
+    ]
+    syms: list[tuple[str, dict[str, Any]]] = [
+        ("get_symbol", {"name": n}) for n in wanted[:MAX_SYMBOLS_PER_FILE]
+    ]
+    return [*refs[:1], *syms[:1], ("get_tests", {"path": file.path}), *refs[1:], *syms[1:]]
+
+
 async def build_tool_context(
     *,
     gateway: ToolGateway,
@@ -155,30 +178,17 @@ async def build_tool_context(
             report.files_skipped_for_budget = len(files) - index
             break
 
-        wanted, defined = _candidate_symbols(file)
-        # get_tests is the cheapest signal per call, so it is never the thing dropped.
-        budget = per_file
-        symbol_slots = max(budget - 2, 0)
-        reference_slots = max(min(budget - symbol_slots - 1, MAX_REFERENCE_SYMBOLS_PER_FILE), 0)
-
-        for name in wanted[:symbol_slots]:
-            result = await gateway.call(agent, "get_symbol", {"name": name})
+        for tool, args in _call_plan(file)[:per_file]:
+            result = await gateway.call(agent, tool, args)
             spent += 1
-            if result.ok and result.data["symbols"]:
-                definitions.setdefault(name, []).extend(result.data["symbols"])
-
-        for name in defined[:reference_slots]:
-            result = await gateway.call(
-                agent, "find_references", {"name": name, "max_results": MAX_REFERENCES_PER_SYMBOL}
-            )
-            spent += 1
-            if result.ok and result.data["references"]:
-                references.setdefault(name, []).extend(result.data["references"])
-
-        result = await gateway.call(agent, "get_tests", {"path": file.path})
-        spent += 1
-        if result.ok and result.data["tests"]:
-            tests.setdefault(file.path, []).extend(result.data["tests"])
+            if not result.ok:
+                continue
+            if tool == "get_symbol" and result.data["symbols"]:
+                definitions.setdefault(args["name"], []).extend(result.data["symbols"])
+            elif tool == "find_references" and result.data["references"]:
+                references.setdefault(args["name"], []).extend(result.data["references"])
+            elif tool == "get_tests" and result.data["tests"]:
+                tests.setdefault(file.path, []).extend(result.data["tests"])
 
     report.definitions = sum(len(v) for v in definitions.values())
     report.references = sum(len(v) for v in references.values())

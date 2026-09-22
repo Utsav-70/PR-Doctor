@@ -54,6 +54,40 @@ class Investigation:
         return sum(c.cost_usd for c in self.calls)
 
 
+# Appended to the review prompt for the investigation phase only.
+#
+# Without it the agent called no tools at all: the review prompt says "surrounding code
+# is provided so you can understand what the change does", which reads as *everything
+# you need is already here*. The model wrote its findings in the investigation call,
+# the reporting call then wrote them again, and the tool budget went unspent. The
+# investigation phase needs a different job description from the reporting phase.
+INVESTIGATION_DIRECTIVE = """
+
+## This request is the investigation phase, not the report
+
+The context above is a starting point, not the whole repository. It was assembled by a
+script that guessed what you would need, and on a large pull request it reaches only
+some of the files.
+
+Use the tools before judging the change. In particular:
+
+- For anything the diff **calls**, read its definition — do not assume what it returns,
+  what it raises, or what units its arguments are in.
+- For anything the diff **defines or changes the signature of**, find its callers. A
+  change that breaks a caller is invisible in the diff, and it is the most valuable
+  thing you can find here.
+- Check whether the changed behaviour is tested.
+- Verify anything you are about to report at low confidence. A lookup that confirms or
+  kills a suspicion is worth more than a hedge.
+
+Do not produce findings yet, and do not write descriptions for the developer — a second
+request does that, and it will see everything you write here. Report only what you
+looked up and what it told you, including the lookups that came back clean.
+
+Stop calling tools once further lookups would not change your judgement of the change.
+"""
+
+
 def _render_tool_result(tool: str, args: dict[str, Any], payload: str) -> str:
     """Tool output as text for the transcript.
 
@@ -355,6 +389,7 @@ async def investigate(
     diff_block: str,
     agent: str = "reviewer",
 ) -> Investigation:
+    system_prompt = system_prompt + INVESTIGATION_DIRECTIVE
     if get_settings().LLM_PROVIDER == "gemini":
         return await investigate_gemini(
             gateway=gateway,

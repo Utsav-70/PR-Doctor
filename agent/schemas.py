@@ -62,7 +62,34 @@ class ReviewUsage(BaseModel):
     stop_reason: str | None = None
 
 
+class CallRecord(BaseModel):
+    """One request to a provider, for the `llm_calls` row.
+
+    Kept per call rather than summed: once Phase 6 fans out, "which stage cost what" is
+    the question worth answering, and a total cannot be un-summed.
+    """
+
+    stage: str = "review"
+    provider: str = "anthropic"
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cost_usd: float = 0.0
+    stop_reason: str | None = None
+    duration_ms: int = 0
+    tool_iterations: int = 0
+    error: str | None = None
+
+
 class ReviewResult(BaseModel):
     report: FindingsReport
     usage: ReviewUsage
     refused: bool = False
+    # Every provider call this review made, in order. `usage` is their sum.
+    calls: list[CallRecord] = Field(default_factory=list)
+    # How many investigation rounds the agent used before reporting. A reviewer that
+    # always uses zero is not investigating; one that always hits the cap is lost.
+    tool_iterations: int = 0
+    budget_stopped: str | None = None

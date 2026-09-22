@@ -1,8 +1,12 @@
 """Database models.
 
-Two tables for this slice. Installation and repository metadata is denormalised onto
-`reviews` — normalising it costs two joins and buys nothing until there is a UI or
-per-repository configuration to hang off it.
+Three tables. Installation and repository metadata is denormalised onto `reviews` —
+normalising it costs two joins and buys nothing until there is a UI or per-repository
+configuration to hang off it.
+
+`review_files` is the exception, and it is normalised for a reason: it is the handoff
+point between processes. The review task computes patches and line maps in memory; the
+posting task (Phase 9) is a different process with empty memory and needs them back.
 """
 
 from __future__ import annotations
@@ -102,7 +106,14 @@ class Review(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    # Incremented on redelivery by the worker, so `running` -> `queued` is a legal
+    # transition rather than an anomaly. A review on attempt 3 is worth looking at.
+    attempt: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
     findings: Mapped[list[Finding]] = relationship(
+        back_populates="review", cascade="all, delete-orphan"
+    )
+    files: Mapped[list[ReviewFile]] = relationship(
         back_populates="review", cascade="all, delete-orphan"
     )
 
@@ -149,3 +160,141 @@ class Finding(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Finding {self.severity} {self.file_path}:{self.line}>"
+
+
+class ReviewFile(Base):
+    """One changed file, as analysed.
+
+    Exists so the per-file facts outlive the review task. Without it the patch, the
+    classification, and the line map are computed, used once, and garbage-collected —
+    which forces every later phase to re-fetch from GitHub to answer questions the
+    pipeline already answered.
+    """
+
+    __tablename__ = "review_files"
+    __table_args__ = (
+        # A retry re-analyses the same commit, so the write must be an upsert rather
+        # than an append. Without this, attempt 2 silently doubles every file.
+        UniqueConstraint("review_id", "path", name="uq_review_file_path"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    review_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="CASCADE"), index=True
+    )
+
+    path: Mapped[str] = mapped_column(String(1024))
+    previous_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    change_type: Mapped[str] = mapped_column(String(16))
+
+    # How to parse it, and what role it plays. Two orthogonal axes — see
+    # github/classify.py for why they are not collapsed into one column.
+    language: Mapped[str] = mapped_column(String(32))
+    category: Mapped[str] = mapped_column(String(32))
+
+    added_lines: Mapped[int] = mapped_column(Integer, default=0)
+    deleted_lines: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Null when GitHub omitted it: binary, oversized, or a mode-only change. This is
+    # the largest column in the schema and the first thing to prune on a retention
+    # policy — it is regenerable from GitHub while the SHA still exists.
+    patch: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # {new_file_line: diff_position}, JSON so the keys are strings on the way out.
+    # GitHub's review API anchors comments to a diff position, not a file line, so
+    # this is what Phase 9 reads instead of re-parsing the patch.
+    diff_line_map: Mapped[dict[str, int]] = mapped_column(JSONB, default=dict)
+
+    reviewed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # Why not, when not: deleted, ignored_path, generated, binary, no_patch,
+    # category_documentation, budget. Unset when the file was reviewed.
+    skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    review: Mapped[Review] = relationship(back_populates="files")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        flag = "reviewed" if self.reviewed else f"skipped:{self.skip_reason}"
+        return f"<ReviewFile {self.path} {self.language}/{self.category} {flag}>"
+
+
+class ToolCall(Base):
+    """One tool invocation, including the denied ones.
+
+    This is the answer to "why did it say that" in Phase 15. Denials matter most:
+    `allowed = false` rows are how an over-broad permission set becomes visible now,
+    while the tools only read — rather than in Phase 11, when they can execute.
+    """
+
+    __tablename__ = "tool_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    review_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="CASCADE"), index=True
+    )
+
+    # Which agent asked. One name in Phase 5; bug/security/performance from Phase 6.
+    agent: Mapped[str] = mapped_column(String(32), index=True)
+    tool: Mapped[str] = mapped_column(String(32), index=True)
+    # Arguments as received. Model-supplied and therefore evidence: a path traversal
+    # attempt is only diagnosable if the rejected argument was recorded.
+    args: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+    allowed: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    denied_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    result_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    result_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self) -> str:  # pragma: no cover
+        verdict = "ok" if self.allowed and self.ok else (self.denied_reason or self.error)
+        return f"<ToolCall {self.agent}/{self.tool} {verdict}>"
+
+
+class LlmCall(Base):
+    """One request to a model provider.
+
+    Separate from `reviews` because Phase 6 fans out to three agents and Phase 8 adds a
+    judge — a review will make many calls, and "which stage cost what" is the question
+    Phase 14 optimises against. Aggregating onto the review row first would lose exactly
+    the breakdown that makes the optimisation possible.
+    """
+
+    __tablename__ = "llm_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    review_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="CASCADE"), index=True
+    )
+
+    # Which pipeline step asked. One value in Phase 5; bug/security/performance/judge
+    # from Phase 6 onward.
+    stage: Mapped[str] = mapped_column(String(32), index=True)
+    provider: Mapped[str] = mapped_column(String(16))
+    model: Mapped[str] = mapped_column(String(64), index=True)
+
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), default=Decimal("0"))
+
+    # Recorded per call rather than derived: a refusal and a max_tokens truncation both
+    # return HTTP 200 with usable-looking output, and telling them apart afterwards is
+    # impossible without this.
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    tool_iterations: Mapped[int] = mapped_column(Integer, default=0)
+
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<LlmCall {self.stage} {self.model} ${self.cost_usd}>"

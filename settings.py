@@ -10,10 +10,11 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+Provider = Literal["anthropic", "gemini"]
 
 
 class Settings(BaseSettings):
@@ -44,12 +45,28 @@ class Settings(BaseSettings):
     CELERY_TASK_TIME_LIMIT: int = 1200
 
     # --- LLM ----------------------------------------------------------------
+    # LLM_MODEL is provider-specific: a Claude id when LLM_PROVIDER=anthropic, a Gemini
+    # id when LLM_PROVIDER=gemini. Switching provider without switching model is the
+    # obvious mistake, so _provider_has_key below refuses to boot on it.
+    LLM_PROVIDER: Provider = "anthropic"
     ANTHROPIC_API_KEY: str | None = None
+    GEMINI_API_KEY: str | None = None
     LLM_MODEL: str = "claude-opus-5"
     LLM_EFFORT: Effort = "high"
     LLM_MAX_TOKENS: int = 16000
     LLM_TIMEOUT_SECONDS: float = 600.0
     LLM_MAX_RETRIES: int = 2
+
+    # --- Phase 5 budgets ------------------------------------------------------
+    # Enforced as the calls happen, not tallied afterwards. A runaway agent that is
+    # only noticed at the end has already spent the money.
+    MAX_LLM_CALLS_PER_REVIEW: int = 25
+    MAX_COST_PER_REVIEW_USD: float = 1.50
+    MAX_TOOL_ITERATIONS: int = 12
+
+    # Run the whole pipeline, record everything, post nothing. The only safe way to
+    # evaluate a prompt or threshold change against live traffic.
+    DRY_RUN: bool = False
 
     # --- budgets ------------------------------------------------------------
     MAX_CHANGED_LINES: int = 3000
@@ -87,6 +104,22 @@ class Settings(BaseSettings):
         if "PRIVATE KEY" not in v:
             raise ValueError("GITHUB_APP_PRIVATE_KEY does not look like a PEM key")
         return v
+
+    @model_validator(mode="after")
+    def _provider_has_key(self) -> Settings:
+        """Fail at boot rather than at the end of an expensive pipeline.
+
+        The Anthropic SDK can fall back to a local auth profile, so an absent key is
+        survivable there. google-genai has no such fallback.
+        """
+        if self.LLM_PROVIDER == "gemini":
+            if not self.GEMINI_API_KEY:
+                raise ValueError("LLM_PROVIDER=gemini requires GEMINI_API_KEY")
+            if self.LLM_MODEL.startswith("claude"):
+                raise ValueError(f"LLM_PROVIDER=gemini but LLM_MODEL={self.LLM_MODEL!r}")
+        if self.LLM_PROVIDER == "anthropic" and self.LLM_MODEL.startswith("gemini"):
+            raise ValueError(f"LLM_PROVIDER=anthropic but LLM_MODEL={self.LLM_MODEL!r}")
+        return self
 
     @field_validator("LLM_MAX_TOKENS")
     @classmethod

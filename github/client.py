@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Any, Self
 
@@ -21,6 +23,44 @@ logger = logging.getLogger(__name__)
 
 RETRY_STATUS = frozenset({500, 502, 503, 504})
 MAX_ATTEMPTS = 3
+
+# GitHub signals a rate limit as 403 (historically) or 429 (increasingly). Both carry
+# Retry-After on a secondary limit, so both must take the same path — treating 429 as a
+# plain error was how a retryable pause became a failed review.
+RATE_LIMIT_STATUS = frozenset({403, 429})
+
+# Cap on a single honoured sleep. Beyond this the task should die and let Celery's
+# backoff reschedule it, rather than hold a worker slot idle.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse Retry-After, which is either delta-seconds or an HTTP-date.
+
+    GitHub sends seconds, but the header is specified both ways and a ValueError here
+    would turn a polite backoff into a crash.
+    """
+    if not value:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - datetime.now(UTC)).total_seconds(), 0.0)
+
+
+def _seconds_until_epoch(value: str) -> float | None:
+    """How long until an x-ratelimit-reset epoch. Logging only."""
+    try:
+        return max(float(value) - datetime.now(UTC).timestamp(), 0.0)
+    except ValueError:
+        return None
 
 
 class GitHubError(RuntimeError):
@@ -101,14 +141,35 @@ class GitHubClient:
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
-            retry_after = response.headers.get("retry-after")
-            if response.status_code == 403 and retry_after and attempt < MAX_ATTEMPTS:
-                logger.warning("secondary rate limit; sleeping %ss", retry_after)
-                await asyncio.sleep(min(float(retry_after), 60.0))
-                continue
+            if response.status_code in RATE_LIMIT_STATUS:
+                delay = _retry_after_seconds(response.headers.get("retry-after"))
+                if delay is not None and attempt < MAX_ATTEMPTS:
+                    logger.warning(
+                        "secondary rate limit; sleeping",
+                        extra={
+                            "status": response.status_code,
+                            "retry_after": delay,
+                            "attempt": attempt,
+                            "url": url,
+                        },
+                    )
+                    await asyncio.sleep(min(delay, MAX_RETRY_AFTER_SECONDS))
+                    continue
 
-            if response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0":
-                raise GitHubError("primary rate limit exhausted", 403)
+                if response.headers.get("x-ratelimit-remaining") == "0":
+                    # Primary limit. The reset can be up to an hour out, so do not
+                    # sleep on it — fail and let Celery's backoff reschedule.
+                    reset = response.headers.get("x-ratelimit-reset", "")
+                    logger.warning(
+                        "primary rate limit exhausted",
+                        extra={
+                            "status": response.status_code,
+                            "reset_epoch": reset,
+                            "resets_in_seconds": _seconds_until_epoch(reset),
+                            "url": url,
+                        },
+                    )
+                    raise GitHubError("primary rate limit exhausted", response.status_code)
 
             return response
 

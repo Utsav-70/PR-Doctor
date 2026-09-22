@@ -43,6 +43,15 @@ mechanism; Phase 14 wires cost into it).
 
 ## Retries
 
+> **Current state (as of Phase 3 completion).** `apps/worker/tasks.py` already carries
+> `max_retries=2`, `retry_backoff=True`, `retry_backoff_max=300`, `retry_jitter=True` on
+> `review.pull_request` — and none of them take effect, because the task neither calls
+> `self.retry()` nor declares `autoretry_for`. An exception propagates, the row goes to
+> `failed`, and nothing retries. The only live redelivery path today is `acks_late` on
+> worker death. `reviews.attempt` exists and is incremented, so the counter is ready
+> before the retry policy that will drive it.
+
+
 The rule: **retry transient failures, never retry bugs.** `autoretry_for=(Exception,)`
 turns a `KeyError` into three `KeyError`s and a dead letter, wasting a full review's
 compute each time.

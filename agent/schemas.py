@@ -7,7 +7,7 @@ the prompt the model sees — they do real work, so keep them precise.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,93 @@ class FindingsReport(BaseModel):
     findings: list[Finding] = Field(
         description="Every issue found. An empty list is a valid and common answer."
     )
+
+
+# --- Phase 7: evidence ---------------------------------------------------------------
+
+# Which checks exist. `semgrep`/`ruff`/`bandit` are declared now and unavailable until
+# Phase 10 — the agent may plan them, the executor records them as `error` with a reason.
+# Declaring them early means the plan schema does not change when Phase 10 lands.
+CheckMethod = Literal["search", "ast", "dataflow", "tests", "semgrep", "ruff", "bandit"]
+Outcome = Literal["supports", "refutes", "inconclusive", "error"]
+
+# How much each method's verdict is worth. A text match proves presence, not semantics;
+# an AST fact is structural. `dataflow` rides on find_references, which does no type
+# inference — the weight states that honestly rather than laundering it.
+EVIDENCE_WEIGHT: dict[str, float] = {
+    "tests": 1.00,
+    "semgrep": 0.90,
+    "ast": 0.85,
+    "bandit": 0.75,
+    "ruff": 0.75,
+    "dataflow": 0.70,
+    "search": 0.60,
+}
+
+
+class Check(BaseModel):
+    method: CheckMethod
+    rationale: str = Field(description="What this check would settle, in one sentence")
+    args: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Arguments for the check. search: {pattern, path_glob}. ast: {name}. "
+            "dataflow: {name}. tests: {path} or {symbol}."
+        ),
+    )
+
+
+class VerificationPlan(BaseModel):
+    """What would settle these claims — chosen before any tool has run."""
+
+    checks: list[Check] = Field(
+        description="At most a handful. Each must be capable of refuting, not only confirming."
+    )
+
+
+class EvidenceVerdict(BaseModel):
+    finding_index: int = Field(
+        description="Index of the finding this verdict is for, as numbered in the prompt", ge=0
+    )
+    verified: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str
+    supporting: list[str] = Field(default_factory=list)
+    refuting: list[str] = Field(default_factory=list)
+
+
+class EvidenceVerdicts(BaseModel):
+    verdicts: list[EvidenceVerdict]
+
+
+# --- Phase 8: judgment ---------------------------------------------------------------
+
+RejectionCode = Literal[
+    "duplicate", "weak_evidence", "irrelevant", "false_positive", "below_threshold"
+]
+
+
+class Judgment(BaseModel):
+    finding_index: int = Field(description="Index of the finding, as numbered in the prompt", ge=0)
+    accepted: bool
+    severity: Severity = Field(description="The severity you consider correct, not the reported one")
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(description="Why accepted or rejected, one or two sentences")
+    rejection_code: RejectionCode | None = None
+    revised_description: str | None = Field(
+        default=None,
+        description=(
+            "Rewritten description if the original was unclear or overstated. Null to keep it."
+        ),
+    )
+    duplicate_of: int | None = Field(
+        default=None,
+        description="If this duplicates another finding, the index it duplicates",
+    )
+
+
+class JudgeVerdict(BaseModel):
+    judgments: list[Judgment]
 
 
 class ReviewUsage(BaseModel):

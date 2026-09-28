@@ -3,10 +3,11 @@
 Tools need a working tree: `search_code` over the REST API is impossible, and
 `read_file` would be one HTTP request per file.
 
-Fetch by SHA rather than clone-then-checkout. `git clone --depth 50` of the default
+Fetch by SHA rather than clone-then-checkout. A shallow `git clone` of the default
 branch frequently does *not* contain a PR head — the branch may have diverged well
-beyond fifty commits, or the PR may target a non-default base. Fetching the exact
-object is both correct and smaller.
+beyond the clone depth, or the PR may target a non-default base. Fetching the exact
+object is both correct and smaller, and it makes depth 1 sufficient: we need the tree
+at one commit, not a window of history that happens to include it.
 """
 
 from __future__ import annotations
@@ -26,7 +27,11 @@ from settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-CLONE_DEPTH = 50
+# One commit, because the tools only ever read the working tree — no blame, no log, no
+# diff against an ancestor. Depth 50 was fetching 49 commits of superseded file versions
+# that nothing opens. Raise this the day something needs history (`git blame` for "who
+# last touched this line" is the likely first caller), not before.
+CLONE_DEPTH = 1
 GIT_TIMEOUT_SECONDS = 120.0
 
 

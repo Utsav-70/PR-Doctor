@@ -13,6 +13,11 @@ from typing import Literal
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Imported rather than redeclared: a severity list that drifts from the one the model is
+# prompted against would silently stop matching. `agent.schemas` is pure type
+# declarations with no imports of its own, so this creates no cycle.
+from agent.schemas import Severity
+
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 Provider = Literal["anthropic", "gemini"]
 
@@ -66,7 +71,47 @@ class Settings(BaseSettings):
 
     # Run the whole pipeline, record everything, post nothing. The only safe way to
     # evaluate a prompt or threshold change against live traffic.
-    DRY_RUN: bool = False
+    #
+    # Default ON. Posting is the one irreversible, developer-visible action in this
+    # system, and the phase doc is explicit: run every new installation in dry-run for
+    # its first week and read what it would have said. Turning this off is a decision
+    # someone should make on purpose.
+    DRY_RUN: bool = True
+
+    # --- Phase 6 multi-agent --------------------------------------------------
+    # Hard filter applied after the planner. Narrow this to run a subset; the planner can
+    # skip an enabled agent but can never run a disabled one.
+    ENABLED_AGENTS: str = "bug,security,performance"
+    # Off skips the routing call and runs every enabled agent. Worth turning off while
+    # tuning the specialist prompts, so a skipped agent is never mistaken for a bad one.
+    ENABLE_PLANNER: bool = True
+    # One agent cannot flood the judge's input.
+    MAX_FINDINGS_PER_AGENT: int = 20
+
+    @property
+    def enabled_agents(self) -> list[str]:
+        return [a.strip() for a in self.ENABLED_AGENTS.split(",") if a.strip()]
+
+    # --- Phase 7 verification -------------------------------------------------
+    # Verification multiplies calls: N findings times two calls each, before the judge
+    # has run. Without caps it is the most expensive stage in the pipeline.
+    #
+    # Findings below this severity are recorded but never posted, so verifying them buys
+    # nothing.
+    SKIP_VERIFY_BELOW_SEVERITY: Severity = "MEDIUM"
+    MAX_VERIFICATION_CHECKS_PER_REVIEW: int = 24
+    MAX_CHECKS_PER_BATCH: int = 4
+
+    # --- Phases 8 and 9: what reaches a developer -----------------------------
+    # Thresholds are the difference between a bot people read and one they mute.
+    CONFIDENCE_THRESHOLD: float = 0.85
+    # Unverified findings clear a higher bar. A finding nothing could corroborate is not
+    # worth the trust it risks unless the reviewer was very sure and the stakes are high.
+    UNVERIFIED_CONFIDENCE_MARGIN: float = 0.10
+    MIN_SEVERITY_TO_POST: Severity = "MEDIUM"
+    # Generous: a good review posts two to five comments. Reviews that routinely hit this
+    # mean the threshold is too low — a signal to act on, not a volume to accept.
+    MAX_COMMENTS_PER_REVIEW: int = 15
 
     # --- budgets ------------------------------------------------------------
     MAX_CHANGED_LINES: int = 3000

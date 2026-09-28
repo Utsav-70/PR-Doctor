@@ -120,24 +120,36 @@ class GitHubClient:
         *,
         accept: str | None = None,
         params: dict[str, Any] | None = None,
+        json: Any = None,
     ) -> httpx.Response:
         """One request with retries on 5xx and rate limits.
 
         Secondary rate limits send `Retry-After` and must be honoured exactly —
         ignoring them escalates to an App-wide block, not just a slower response.
+
+        **Retries are for GET only.** A 502 on `POST /pulls/{n}/reviews` does not say
+        whether the review was created — GitHub may have applied it and failed on the
+        way back. Retrying that posts the review twice, which is developer-visible and
+        cannot be undone. An unposted review is recoverable; a double-posted one is not.
         """
         headers = {"Accept": accept} if accept else None
         last_error: Exception | None = None
+        idempotent = method.upper() in {"GET", "HEAD"}
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = await self._client.request(method, url, headers=headers, params=params)
+                response = await self._client.request(
+                    method, url, headers=headers, params=params, json=json
+                )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
+                if not idempotent:
+                    # The request may have reached GitHub. Fail rather than guess.
+                    raise GitHubError(f"{method} {url} failed in transit: {exc}") from exc
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
-            if response.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS:
+            if response.status_code in RETRY_STATUS and idempotent and attempt < MAX_ATTEMPTS:
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
@@ -252,3 +264,68 @@ class GitHubClient:
                 f"fetching diff failed: HTTP {response.status_code}", response.status_code
             )
         return response.text
+
+    async def list_review_comments(
+        self, owner: str, repo: str, number: int, review_id: int
+    ) -> list[dict[str, Any]]:
+        """Inline comments belonging to one review.
+
+        The create-review response carries the review, not its comments, so the comment
+        IDs needed to trace a finding to what a developer actually sees come from here.
+        """
+        response = await self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments",
+            params={"per_page": 100},
+        )
+        if response.status_code >= 400:
+            # Not fatal: the review is already posted. Losing the IDs costs traceability,
+            # not correctness, and raising here would mark a successful post as failed.
+            logger.warning(
+                "could not list review comments",
+                extra={"status": response.status_code, "review_id": review_id},
+            )
+            return []
+        return list(response.json())
+
+    async def create_review(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        commit_id: str,
+        body: str,
+        comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Post one review carrying every inline comment.
+
+        One request, not one per comment. N separate calls send N notifications to
+        everyone watching the PR, cost N rate-limit units, and can fail halfway leaving
+        a partial review that cannot be cleanly retried.
+
+        `commit_id` is mandatory: without it GitHub anchors the comments to whatever the
+        latest commit is by the time the request lands, which may not be the commit that
+        was reviewed.
+
+        `event` is always COMMENT. REQUEST_CHANGES would make one false positive block a
+        release, which is how a review bot gets uninstalled.
+        """
+        response = await self._request(
+            "POST",
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews",
+            json={
+                "commit_id": commit_id,
+                "event": "COMMENT",
+                "body": body,
+                "comments": comments,
+            },
+        )
+        if response.status_code >= 400:
+            # 422 is the anchoring failure: a position that is not in the diff. The
+            # body names the offending comment, so it is worth keeping.
+            raise GitHubError(
+                f"posting review failed: HTTP {response.status_code}: {response.text[:500]}",
+                response.status_code,
+            )
+        return dict(response.json())

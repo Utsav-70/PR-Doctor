@@ -99,15 +99,21 @@ REGISTRY: dict[str, ToolSpec] = {
     ),
 }
 
-# Per-agent allowlists. The performance agent has no business reading arbitrary files;
-# the security agent has no business enumerating tests. Phase 6 adds the other agents;
-# `reviewer` is the single agent Phase 5 runs.
+# Per-agent allowlists. `reviewer` is the Phase 5 generalist; the other three are the
+# Phase 6 fan-out.
+#
+# The performance agent is deliberately denied `search_code`: its questions are local and
+# structural, and a broad text search is how it wanders into code the diff never touched.
+# The judge only verifies claims it was handed, so it cannot go exploring at all.
+#
+# Denials are recorded, so if one of these turns out to be wrong the audit log says so
+# rather than the agent silently doing worse work.
 DEFAULT_PERMISSIONS: dict[str, frozenset[str]] = {
     "reviewer": frozenset(REGISTRY),
     "bug": frozenset(REGISTRY),
-    "security": frozenset({"read_file", "search_code", "get_symbol", "find_references"}),
+    "security": frozenset(REGISTRY),
     "performance": frozenset({"read_file", "get_symbol", "find_references"}),
-    "judge": frozenset({"read_file", "get_symbol"}),
+    "judge": frozenset({"read_file", "get_symbol", "search_code", "find_references", "get_tests"}),
 }
 
 MAX_TOOL_CALLS_PER_REVIEW = 60

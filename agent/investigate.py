@@ -105,6 +105,7 @@ async def investigate_gemini(
     system_prompt: str,
     repository_block: str,
     diff_block: str,
+    role_block: str = "",
     agent: str = "reviewer",
 ) -> Investigation:
     """Let Gemini explore the repository before reporting.
@@ -142,6 +143,7 @@ async def investigate_gemini(
             parts=[
                 types.Part(text=repository_block),
                 types.Part(text=diff_block),
+                *([types.Part(text=role_block)] if role_block else []),
                 types.Part(
                     text=(
                         "Investigate this change using the tools before reporting. Look up "
@@ -199,17 +201,24 @@ async def investigate_gemini(
         # Loop ran to the cap without the agent volunteering to stop.
         state.stopped_by = "iterations"
 
-    logger.info(
-        "investigation complete",
-        extra={
-            "iterations": state.iterations,
-            "tool_calls": gateway.usage.calls,
-            "denied": gateway.usage.denied,
-            "cost_usd": round(state.cost_usd, 4),
-            "stopped_by": state.stopped_by,
-        },
-    )
+    _log_investigation(state, gateway)
     return state
+
+
+def _log_investigation(state: Investigation, gateway: ToolGateway) -> None:
+    """Interpolated into the message, not passed as `extra`.
+
+    Nothing configures a formatter, so `extra` fields are dropped by Celery's default
+    handler — which made the single most useful diagnostic in this phase invisible.
+    """
+    logger.info(
+        "investigation complete: %d iterations, %d tool calls (%d denied), $%.4f, stopped_by=%s",
+        state.iterations,
+        gateway.usage.calls,
+        gateway.usage.denied,
+        state.cost_usd,
+        state.stopped_by or "agent",
+    )
 
 
 def _gemini_record(response: Any, settings: Any, started: float, iteration: int) -> CallRecord:
@@ -250,6 +259,7 @@ async def investigate_anthropic(
     system_prompt: str,
     repository_block: str,
     diff_block: str,
+    role_block: str = "",
     agent: str = "reviewer",
 ) -> Investigation:
     """Same loop against Claude.
@@ -282,6 +292,7 @@ async def investigate_anthropic(
             "content": [
                 {"type": "text", "text": repository_block, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": diff_block},
+                *([{"type": "text", "text": role_block}] if role_block else []),
                 {
                     "type": "text",
                     "text": (
@@ -369,15 +380,7 @@ async def investigate_anthropic(
     finally:
         await client.close()
 
-    logger.info(
-        "investigation complete",
-        extra={
-            "iterations": state.iterations,
-            "tool_calls": gateway.usage.calls,
-            "cost_usd": round(state.cost_usd, 4),
-            "stopped_by": state.stopped_by,
-        },
-    )
+    _log_investigation(state, gateway)
     return state
 
 
@@ -387,6 +390,7 @@ async def investigate(
     system_prompt: str,
     repository_block: str,
     diff_block: str,
+    role_block: str = "",
     agent: str = "reviewer",
 ) -> Investigation:
     system_prompt = system_prompt + INVESTIGATION_DIRECTIVE
@@ -396,6 +400,7 @@ async def investigate(
             system_prompt=system_prompt,
             repository_block=repository_block,
             diff_block=diff_block,
+            role_block=role_block,
             agent=agent,
         )
     return await investigate_anthropic(
@@ -403,5 +408,6 @@ async def investigate(
         system_prompt=system_prompt,
         repository_block=repository_block,
         diff_block=diff_block,
+        role_block=role_block,
         agent=agent,
     )

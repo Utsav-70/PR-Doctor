@@ -8,25 +8,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 
 from agent.graph import UsageAccumulator, run_review_graph
-from agent.schemas import CallRecord
+from agent.judge import dedupe_key
+from agent.schemas import CallRecord, Judgment
+from agent.schemas import Finding as FindingSchema
 from agent.tools.gateway import ToolGateway
 from agent.tools.workspace import PathNotAllowed, Workspace
 from apps.worker.celery_app import celery_app
-from db.models import Finding, LlmCall, Review, ReviewFile, ReviewStatus
+from db.models import Evidence, Finding, LlmCall, Review, ReviewFile, ReviewStatus
 from db.session import session_scope
 from domain import PullRequestContext
 from github.analyze import build_pull_request_context
 from github.checkout import checkout
 from github.classify import looks_generated
 from github.client import GitHubClient, GitHubError
+from github.comments import PostPlan, PostResult, build_post_plan, post_review
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -132,6 +136,7 @@ async def _run_pipeline(
     expected_head_sha: str,
 ) -> dict[str, Any]:
     settings = get_settings()
+    started = time.perf_counter()
 
     # --- fetch -----------------------------------------------------------------
     async with GitHubClient(installation_id) as gh:
@@ -191,16 +196,54 @@ async def _run_pipeline(
         await _persist_files(review_id, ctx)
 
         gateway = ToolGateway(workspace, review_id=review_id)
-        state = await run_review_graph(review_id=review_id, pr=ctx, gateway=gateway)
+        state = await run_review_graph(
+            review_id=review_id,
+            pr=ctx,
+            gateway=gateway,
+            # Cross-review dedupe. Fetched before the graph runs because the judge needs
+            # it: a finding already posted against an earlier commit of this PR should
+            # not be re-accepted, or five pushes accumulate five copies of a comment.
+            already_posted_keys=await _posted_dedupe_keys(f"{owner}/{repo}", pr_number),
+        )
 
     kept = state.get("findings", [])
     dropped = [(d.finding, d.reason) for d in state.get("dropped", [])]
+    collapsed = state.get("collapsed", [])
+    judgments = {j.finding_index: j for j in state.get("judgments", [])}
+    finding_agents = state.get("finding_agents", [])
+    evidence = state.get("evidence", {})
+    verdicts = state.get("verdicts", {})
     usage = state.get("usage") or UsageAccumulator()
     errors = state.get("errors", [])
     bundle = state.get("context_bundle")
     truncated = bool(bundle and bundle.truncated)
 
     await _persist_llm_calls(review_id, usage.calls)
+
+    # --- publish (Phases 8 and 9) -----------------------------------------------
+    # Only what the judge accepted is a candidate for posting. The judge decided
+    # *whether*; the guardrails below check *that it is safe to*, deterministically.
+    #
+    # A judge failure yields no judgments, so this list is empty and nothing posts. That
+    # is the invariant, not an accident: a broken PRGuard posts nothing, never something
+    # wrong.
+    accepted = [
+        (_apply_judgment(finding, judgments[index]), position)
+        for index, (finding, position) in enumerate(kept)
+        if index in judgments and judgments[index].accepted
+    ]
+    judge_failed = any(e.stage == "judge" for e in errors)
+
+    plan = build_post_plan(
+        accepted,
+        ctx,
+        review_id=str(review_id),
+        already_posted=await _already_posted(f"{owner}/{repo}", pr_number),
+        duration_seconds=time.perf_counter() - started,
+    )
+    blocked_by_key = {
+        (b.finding.file, b.finding.line, b.finding.category): b.reason for b in plan.blocked
+    }
 
     async with session_scope() as session:
         review = (await session.execute(select(Review).where(Review.id == review_id))).scalar_one()
@@ -217,17 +260,84 @@ async def _run_pipeline(
         review.cache_read_tokens = usage.cache_read_tokens
         review.cache_creation_tokens = usage.cache_creation_tokens
         review.cost_usd = Decimal(str(round(usage.cost_usd, 6)))
-        review.status = ReviewStatus.PARTIAL if review.is_partial else ReviewStatus.COMPLETED
+        # A judge that could not run is a failed review, not a degraded one: every
+        # finding is unjudged and none may be posted, so presenting it as completed
+        # would misreport what happened.
+        review.status = (
+            ReviewStatus.FAILED
+            if judge_failed
+            else (ReviewStatus.PARTIAL if review.is_partial else ReviewStatus.COMPLETED)
+        )
         review.finished_at = datetime.now(UTC)
         if errors:
             # Degraded stages, not a failed review. Recorded so "why were there no
             # findings" has an answer that is not guesswork.
             review.error = {
-                "type": "degraded",
+                "type": "judge_failed" if judge_failed else "degraded",
                 "stages": [{"stage": e.stage, "kind": e.kind, "detail": e.detail} for e in errors],
             }
 
-        for finding, position in kept:
+        rows: list[tuple[int, Finding]] = []
+        for index, (finding, position) in enumerate(kept):
+            judgment = judgments.get(index)
+            verified, adjusted, _ = verdicts.get(index, (None, None, ""))
+            row = Finding(
+                review_id=review_id,
+                file_path=finding.file,
+                line=finding.line,
+                diff_position=position,
+                severity=judgment.severity if judgment else finding.severity,
+                category=finding.category,
+                title=finding.title[:200],
+                # The judge's rewrite wins, but the original is kept: comparing the two
+                # across a hundred reviews is what shows how the reviewer prompts are
+                # miscalibrated.
+                description=(judgment.revised_description if judgment and judgment.revised_description else finding.description),
+                description_original=(
+                    finding.description
+                    if judgment and judgment.revised_description
+                    else None
+                ),
+                confidence=Decimal(str(round(finding.confidence, 3))),
+                dropped=False,
+                agent=finding_agents[index] if index < len(finding_agents) else None,
+                dedupe_key=dedupe_key(finding),
+                verified=verified,
+                verified_confidence=(
+                    Decimal(str(round(adjusted, 3))) if adjusted is not None else None
+                ),
+                judge_accepted=judgment.accepted if judgment else None,
+                judge_confidence=(
+                    Decimal(str(round(judgment.confidence, 3))) if judgment else None
+                ),
+                judge_reason=judgment.reason if judgment else None,
+                rejection_code=judgment.rejection_code if judgment else None,
+                blocked_reason=blocked_by_key.get(
+                    (finding.file, finding.line, finding.category)
+                ),
+            )
+            session.add(row)
+            rows.append((index, row))
+
+        # Findings must have IDs before evidence can reference them.
+        await session.flush()
+        for index, row in rows:
+            for item in evidence.get(index, []):
+                session.add(
+                    Evidence(
+                        finding_id=row.id,
+                        method=item.method[:16],
+                        outcome=item.outcome[:16],
+                        weight=Decimal(str(round(item.weight, 3))),
+                        rationale=item.rationale,
+                        detail=item.detail,
+                        duration_ms=item.duration_ms,
+                    )
+                )
+
+        # Collapsed exact duplicates are recorded rather than discarded — the duplicate
+        # rate is how you tell that agent prompts overlap too much.
+        for finding, position in collapsed:
             session.add(
                 Finding(
                     review_id=review_id,
@@ -240,8 +350,13 @@ async def _run_pipeline(
                     description=finding.description,
                     confidence=Decimal(str(round(finding.confidence, 3))),
                     dropped=False,
+                    dedupe_key=dedupe_key(finding),
+                    judge_accepted=False,
+                    rejection_code="duplicate",
+                    judge_reason="Exact duplicate collapsed before judging.",
                 )
             )
+
         for finding, reason in dropped:
             session.add(
                 Finding(
@@ -259,26 +374,131 @@ async def _run_pipeline(
                 )
             )
 
+    # Posted after the findings are on record, never before. If posting succeeds and the
+    # process then dies, a retry sees `posted_at` and does not comment twice; the reverse
+    # order would double-post, which is the one mistake here that a developer sees.
+    post = await post_review(
+        plan,
+        installation_id=installation_id,
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=expected_head_sha,
+    )
+    if post.posted:
+        await _mark_posted(review_id, plan, post)
+
+    rejections: dict[str, int] = {}
+    for judgment in judgments.values():
+        if not judgment.accepted:
+            code = judgment.rejection_code or "unspecified"
+            rejections[code] = rejections.get(code, 0) + 1
+
     logger.info(
-        "review finished",
-        extra={
-            "review_id": str(review_id),
-            "kept": len(kept),
-            "dropped": len(dropped),
-            "llm_calls": len(usage.calls),
-            "tool_calls": gateway.usage.calls,
-            "tool_iterations": state.get("tool_iterations", 0),
-            "cost_usd": round(usage.cost_usd, 4),
-        },
+        "review finished: %d candidates -> %d accepted -> %d posted (%s) · "
+        "rejected %s · %d llm calls, %d tool calls, $%.4f",
+        len(kept),
+        len(accepted),
+        len(plan.anchored) if post.posted else 0,
+        post.skipped_reason or f"review {post.github_review_id}",
+        ", ".join(f"{k}={v}" for k, v in sorted(rejections.items())) or "none",
+        len(usage.calls),
+        gateway.usage.calls,
+        usage.cost_usd,
     )
     return {
-        "status": "completed",
-        "findings": len(kept),
+        "status": "failed" if judge_failed else "completed",
+        "candidates": len(kept),
+        "accepted": len(accepted),
         "dropped": len(dropped),
+        "collapsed": len(collapsed),
+        "blocked": len(plan.blocked),
+        "posted": len(plan.anchored) if post.posted else 0,
+        "post_status": post.skipped_reason or "posted",
+        "rejections": rejections,
         "llm_calls": len(usage.calls),
         "tool_calls": gateway.usage.calls,
         "cost_usd": round(usage.cost_usd, 6),
     }
+
+
+def _apply_judgment(finding: FindingSchema, judgment: Judgment) -> FindingSchema:
+    """The judged form of a finding: revised severity, description and confidence.
+
+    Returns a copy — the original is persisted alongside so the two can be compared.
+    """
+    return finding.model_copy(
+        update={
+            "severity": judgment.severity,
+            "confidence": judgment.confidence,
+            "description": judgment.revised_description or finding.description,
+        }
+    )
+
+
+async def _posted_dedupe_keys(repository_full_name: str, pr_number: int) -> set[str]:
+    """Dedupe keys already posted on this PR, for the judge's cross-review check.
+
+    Content-based rather than line-based, so a finding whose line shifted because an
+    earlier hunk grew still matches. This is what `_already_posted` could not do.
+    """
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(Finding.dedupe_key)
+            .join(Review, Review.id == Finding.review_id)
+            .where(
+                Review.repository_full_name == repository_full_name,
+                Review.pr_number == pr_number,
+                Finding.posted_at.is_not(None),
+                Finding.dedupe_key.is_not(None),
+            )
+        )
+        return {key for (key,) in rows if key}
+
+
+async def _already_posted(
+    repository_full_name: str, pr_number: int
+) -> set[tuple[str, int, str]]:
+    """Findings already commented on this PR, by (path, line, category).
+
+    Prevents a second push re-posting a comment that is still sitting on the PR.
+
+    KNOWN GAP (Phase 8): the key is the *current* line number, so a finding whose line
+    shifted because an earlier hunk grew will not match and will be posted again. Proper
+    cross-SHA deduplication needs content-based identity, which is Phase 8's job — this
+    catches the common case where the surrounding file did not move.
+    """
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(Finding.file_path, Finding.line, Finding.category)
+            .join(Review, Review.id == Finding.review_id)
+            .where(
+                Review.repository_full_name == repository_full_name,
+                Review.pr_number == pr_number,
+                Finding.posted_at.is_not(None),
+            )
+        )
+        return {(path, line, category) for path, line, category in rows}
+
+
+async def _mark_posted(uuid_: uuid.UUID, plan: PostPlan, post: PostResult) -> None:
+    """Record what reached a developer, and which GitHub comment carries it."""
+    async with session_scope() as session:
+        now = datetime.now(UTC)
+        for item in plan.anchored:
+            await session.execute(
+                update(Finding)
+                .where(
+                    Finding.review_id == uuid_,
+                    Finding.file_path == item.finding.file,
+                    Finding.line == item.finding.line,
+                    Finding.category == item.finding.category,
+                )
+                .values(
+                    posted_at=now,
+                    github_comment_id=post.comment_ids.get((item.finding.file, item.position)),
+                )
+            )
 
 
 async def _persist_files(review_id: uuid.UUID, ctx: PullRequestContext) -> None:

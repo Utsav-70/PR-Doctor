@@ -35,9 +35,16 @@ from domain import PullRequestContext, PullRequestFile
 
 logger = logging.getLogger(__name__)
 
-# Identifiers worth asking about. Keywords and builtins are noise — nobody needs the
+# What the new code *calls* — the trailing `(` is the whole point. `get_symbol` answers
+# "what does this function do", so feeding it every identifier on the line meant looking
+# up local variables: `result = compute_tax(order.total, rate)` offered `result`, `order`
+# and `total` alongside the one name that matters, and frequency ranking preferred them
+# because a local is mentioned more often than the function it is assigned from.
+#
+# Attribute calls match on the final segment: `client.fetch_user(id)` yields `fetch_user`,
+# which is what get_symbol can resolve. Keywords and builtins stay out — nobody needs the
 # definition of `len`.
-_IDENTIFIER = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b")
+_CALL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
 _UNINTERESTING = frozenset(keyword.kwlist) | set(dir(builtins)) | {
     "self", "cls", "args", "kwargs", "None", "True", "False",
 }
@@ -62,7 +69,11 @@ _HUNK_ENCLOSING = re.compile(r"^@@[^@]*@@\s*(?:async\s+)?(?:def|class)\s+([A-Za-
 CONTEXT_BUILDER_BUDGET_SHARE = 0.4
 
 # Ceilings per file, applied only when the file count leaves room for them.
-MAX_SYMBOLS_PER_FILE = 4
+#
+# Two, not four: the candidate list past the first couple of entries is frequency-ranked
+# guessing, and a small pull request was spending 18 calls on three files to fetch
+# definitions nobody asked for. The agent can request a third if it wants one.
+MAX_SYMBOLS_PER_FILE = 2
 MAX_REFERENCE_SYMBOLS_PER_FILE = 2
 MAX_REFERENCES_PER_SYMBOL = 8
 # Calls a single file consumes at full allowance: symbols + references + one get_tests.
@@ -101,6 +112,11 @@ def _candidate_symbols(file: PullRequestFile) -> tuple[list[str], list[str]]:
 
     defined: list[str] = []
     mentioned: dict[str, int] = {}
+    # First appearance, used to break frequency ties. Most calls in a hunk appear once,
+    # so the tiebreak decides almost every ranking — sorting by name meant `Receipt` beat
+    # `compute_tax` on spelling alone. Source order is at least about the code.
+    first_seen: dict[str, int] = {}
+    position = 0
 
     for line in file.patch.split("\n"):
         if line.startswith("@@"):
@@ -113,18 +129,29 @@ def _candidate_symbols(file: PullRequestFile) -> tuple[list[str], list[str]]:
         match = _DEFINITION.match(line)
         if match:
             defined.append(match.group(1))
-        for name in _IDENTIFIER.findall(line[1:]):
+        for name in _CALL.findall(line[1:]):
             if name in _UNINTERESTING:
                 continue
             mentioned[name] = mentioned.get(name, 0) + 1
+            first_seen.setdefault(name, position)
+            position += 1
 
     defined = list(dict.fromkeys(defined))
 
-    # Symbols the diff defines come first — they are the change. Then whatever the new
-    # code leans on most, by frequency, with name as a tiebreak so the order is stable.
-    ranked = sorted(mentioned.items(), key=lambda kv: (-kv[1], kv[0]))
-    ordered = list(dict.fromkeys(defined + [name for name, _ in ranked]))
-    return ordered[:MAX_SYMBOLS_PER_FILE], defined[:MAX_REFERENCE_SYMBOLS_PER_FILE]
+    # The two lists answer different questions, so they must not compete for the same
+    # names. What the diff *defines* goes to find_references — who breaks. What it
+    # *calls* goes to get_symbol — what am I calling. Letting defined names lead both
+    # meant `capture` and its class consumed every get_symbol slot while `compute_tax`
+    # and `charge_card`, the calls the change actually depends on, were never looked up.
+    #
+    # A definition's own name matches the call pattern (`def capture(`), so it is
+    # filtered out here rather than by the regex.
+    called = {n: c for n, c in mentioned.items() if n not in set(defined)}
+    ranked = sorted(called.items(), key=lambda kv: (-kv[1], first_seen[kv[0]]))
+    return (
+        [name for name, _ in ranked][:MAX_SYMBOLS_PER_FILE],
+        defined[:MAX_REFERENCE_SYMBOLS_PER_FILE],
+    )
 
 
 def _call_plan(file: PullRequestFile) -> list[tuple[str, dict[str, Any]]]:
@@ -215,15 +242,21 @@ async def build_tool_context(
         kept.append(rendered)
         budget -= len(rendered)
 
-    if report.trimmed_sections or report.files_skipped_for_budget:
-        logger.info(
-            "context reduced",
-            extra={
-                "trimmed_sections": report.trimmed_sections,
-                "files_skipped_for_budget": report.files_skipped_for_budget,
-                "calls_per_file": report.calls_per_file,
-            },
-        )
+    # Yield, not just spend. Calls are cheap — their results are what fills the prompt,
+    # so a call that came back empty is the thing worth cutting, and the ratio is the
+    # only honest basis for tuning the per-file recipe.
+    logger.info(
+        "context built: %d files, %d calls -> %d defs, %d refs, %d tests "
+        "(%d calls/file, %d files unreached, trimmed=%s)",
+        report.files,
+        spent,
+        report.definitions,
+        report.references,
+        report.tests,
+        report.calls_per_file,
+        report.files_skipped_for_budget,
+        ",".join(report.trimmed_sections) or "none",
+    )
 
     repository_block = "\n".join(
         ['<repository_content untrusted="true">', *kept, "</repository_content>"]

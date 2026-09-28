@@ -13,16 +13,14 @@ from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 from typing import Any
 
+from agent.prompts import load_agent_section, load_shared
 from agent.schemas import CallRecord, FindingsReport, ReviewResult, ReviewUsage
 from agent.tools.gateway import ToolGateway
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
-
-PROMPT_PATH = Path(__file__).parent / "prompts" / "code_review.md"
 
 # USD per million tokens, (input, output). Anthropic cache writes bill at ~1.25x input
 # and reads at ~0.1x; Gemini's implicit cache reads bill at ~0.25x and it has no
@@ -67,10 +65,6 @@ _GEMINI_REFUSAL_REASONS = frozenset(
 )
 
 
-def load_prompt() -> str:
-    return PROMPT_PATH.read_text(encoding="utf-8")
-
-
 def estimate_cost(
     model: str,
     input_tokens: int,
@@ -90,12 +84,28 @@ def estimate_cost(
     return total / 1_000_000
 
 
+def render_focus(agent: str, focus: list[str] | None) -> str:
+    """The planner's per-agent file hints, as an uncached trailing block.
+
+    **This must never enter the cached prefix.** The repository bundle behind the cache
+    breakpoint is byte-identical across all three agents, which is what makes agents two
+    and three cost ~0.1x for it. Interpolating an agent name or a focus list into that
+    block gives each agent a different prefix, every cache read becomes a cache write,
+    and the phase costs triple instead of a third more.
+    """
+    if not focus:
+        return ""
+    listed = "\n".join(f"- {path}" for path in focus[:10])
+    return f"<focus agent=\"{agent}\">\nLook at these files first:\n{listed}\n</focus>"
+
+
 async def review_diff(
     repository_block: str,
     diff_block: str,
     *,
     gateway: ToolGateway | None = None,
     agent: str = "reviewer",
+    focus: list[str] | None = None,
 ) -> ReviewResult:
     """Investigate (if tools are available), then report.
 
@@ -105,6 +115,9 @@ async def review_diff(
     pattern-matches and one that checks.
     """
     settings = get_settings()
+    # Identical across agents, so the cached prefix runs from here through the diff.
+    system_prompt = load_shared()
+    role_block = f"<your_role>\n{load_agent_section(agent)}\n</your_role>"
 
     investigation = None
     if gateway is not None:
@@ -112,17 +125,28 @@ async def review_diff(
 
         investigation = await investigate(
             gateway=gateway,
-            system_prompt=load_prompt(),
+            system_prompt=system_prompt,
             repository_block=repository_block,
             diff_block=diff_block,
+            role_block=role_block,
             agent=agent,
         )
 
-    transcript = investigation.transcript if investigation else ""
+    # Everything that varies per agent rides here, after the shared prefix: the role, the
+    # planner's focus hints, and the investigation transcript.
+    tail = "\n".join(
+        t
+        for t in (
+            role_block,
+            render_focus(agent, focus),
+            investigation.transcript if investigation else "",
+        )
+        if t
+    )
     if settings.LLM_PROVIDER == "gemini":
-        result = await _review_gemini(repository_block, diff_block, transcript)
+        result = await _review_gemini(repository_block, diff_block, tail, agent)
     else:
-        result = await _review_anthropic(repository_block, diff_block, transcript)
+        result = await _review_anthropic(repository_block, diff_block, tail, agent)
 
     if investigation is not None:
         # Investigation calls come first so `llm_calls` reads in execution order.
@@ -138,7 +162,7 @@ async def review_diff(
 
 
 async def _review_anthropic(
-    repository_block: str, diff_block: str, transcript: str = ""
+    repository_block: str, diff_block: str, transcript: str = "", agent: str = "reviewer"
 ) -> ReviewResult:
     """Claude via the Anthropic SDK.
 
@@ -166,7 +190,7 @@ async def _review_anthropic(
             system=[
                 {
                     "type": "text",
-                    "text": load_prompt(),
+                    "text": load_shared(),
                     # Breakpoint 1: frozen across every review of every repository.
                     "cache_control": {"type": "ephemeral"},
                 }
@@ -230,7 +254,7 @@ async def _review_anthropic(
 
 
 async def _review_gemini(
-    repository_block: str, diff_block: str, transcript: str = ""
+    repository_block: str, diff_block: str, transcript: str = "", agent: str = "reviewer"
 ) -> ReviewResult:
     """Gemini via google-genai.
 
@@ -252,12 +276,16 @@ async def _review_gemini(
         model=settings.LLM_MODEL,
         contents=[repository_block, diff_block, *([transcript] if transcript else [])],
         config=types.GenerateContentConfig(
-            system_instruction=load_prompt(),
+            system_instruction=load_shared(),
             max_output_tokens=settings.LLM_MAX_TOKENS,
             response_mime_type="application/json",
             # A Pydantic model is accepted directly, so the schema stays single-sourced
             # with the Anthropic path rather than being hand-written as JSON Schema.
             response_schema=FindingsReport,
+            # No tools are declared here, so AFC has nothing to invoke — but the SDK
+            # logs that it is enabled regardless, and that line arriving right after
+            # "investigation complete" reads as though the tool loop used AFC.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             thinking_config=types.ThinkingConfig(
                 thinking_budget=_gemini_thinking_budget(settings.LLM_MODEL, settings.LLM_EFFORT),
             ),
@@ -327,11 +355,9 @@ def _record(provider: str, model: str, usage: ReviewUsage, started: float) -> Ca
 
 def _log_complete(report: FindingsReport, usage: ReviewUsage) -> None:
     logger.info(
-        "review complete",
-        extra={
-            "provider": get_settings().LLM_PROVIDER,
-            "findings": len(report.findings),
-            "cost_usd": round(usage.cost_usd, 4),
-            "cache_read": usage.cache_read_tokens,
-        },
+        "review complete: %d findings, $%.4f, %d cached input tokens (%s)",
+        len(report.findings),
+        usage.cost_usd,
+        usage.cache_read_tokens,
+        get_settings().LLM_PROVIDER,
     )

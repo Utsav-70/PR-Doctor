@@ -154,6 +154,44 @@ class Finding(Base):
     dropped: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     drop_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Phase 6. Which specialist reported this. Per-agent precision is the number that
+    # says whether a prompt is pulling its weight, and it cannot be recovered later.
+    agent: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+
+    # A finding's life is recorded in four separate columns rather than one status,
+    # because the four questions have different answers and conflating them hides the
+    # one that matters:
+    #
+    #   drop_reason      validation rejected it as malformed        (Phase 5)
+    #   verified         evidence ran and what it showed            (Phase 7)
+    #   rejection_code   the judge declined to publish it           (Phase 8)
+    #   blocked_reason   a guardrail declined to publish it         (Phase 9)
+    #
+    # A threshold tuned too tight and a bad prompt look identical in a single column.
+
+    # Phase 7. `verified` is null when verification did not run (capped, or the severity
+    # was below the floor) — distinct from false, which means it ran and proved nothing.
+    verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    verified_confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 3), nullable=True)
+
+    # Phase 8.
+    judge_accepted: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    judge_confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 3), nullable=True)
+    judge_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rejection_code: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # Kept when the judge rewrites `description`. Comparing the two across a hundred
+    # reviews is what tells you how the reviewer prompts are miscalibrated.
+    description_original: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Hash of (file, line, category, normalised title). The key cross-review dedupe
+    # matches on, so a PR with five pushes does not accumulate five copies of a comment.
+    dedupe_key: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+
+    # Indexed in the migration as a *partial* index (WHERE posted_at IS NOT NULL) —
+    # `index=True` here would declare a full one and the two would disagree.
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    github_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    blocked_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     review: Mapped[Review] = relationship(back_populates="findings")
@@ -298,3 +336,34 @@ class LlmCall(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<LlmCall {self.stage} {self.model} ${self.cost_usd}>"
+
+
+class Evidence(Base):
+    """One executed verification check.
+
+    Refutations are kept as carefully as confirmations — more carefully, in fact. The set
+    of refuted findings is where false-positive analysis starts, and it is how a prompt
+    regression is told apart from a tooling one.
+
+    `detail` is what makes a posted comment defensible: the comment can cite "no unique
+    constraint on payments.idempotency_key" because a row here recorded exactly that.
+    """
+
+    __tablename__ = "evidence"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    finding_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("findings.id", ondelete="CASCADE"), index=True
+    )
+
+    method: Mapped[str] = mapped_column(String(16))
+    outcome: Mapped[str] = mapped_column(String(16), index=True)
+    weight: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=0)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<Evidence {self.method} {self.outcome} w={self.weight}>"

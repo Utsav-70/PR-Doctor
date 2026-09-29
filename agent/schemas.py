@@ -74,15 +74,34 @@ EVIDENCE_WEIGHT: dict[str, float] = {
 
 
 class Check(BaseModel):
+    """One verification check.
+
+    Arguments are explicit optional fields rather than an open `dict`. Two reasons, and
+    the second is the one that forced it:
+
+    1. The model can only name arguments that exist, instead of inventing keys the
+       gateway then rejects at validation time.
+    2. A `dict[str, Any]` renders as `additionalProperties` in JSON Schema, and the
+       Gemini Developer API refuses any schema containing it.
+    """
+
     method: CheckMethod
     rationale: str = Field(description="What this check would settle, in one sentence")
-    args: dict[str, Any] = Field(
-        default_factory=dict,
-        description=(
-            "Arguments for the check. search: {pattern, path_glob}. ast: {name}. "
-            "dataflow: {name}. tests: {path} or {symbol}."
-        ),
-    )
+    pattern: str | None = Field(default=None, description="search: the regex to look for")
+    path_glob: str | None = Field(default=None, description="search: restrict to these paths")
+    name: str | None = Field(default=None, description="ast / dataflow: the symbol name")
+    path: str | None = Field(default=None, description="tests: the file to find tests for")
+    symbol: str | None = Field(default=None, description="tests: the symbol to find tests for")
+
+    def tool_args(self) -> dict[str, Any]:
+        """The arguments this check's tool actually takes, dropping the unset ones."""
+        by_method: dict[str, dict[str, Any]] = {
+            "search": {"pattern": self.pattern, "path_glob": self.path_glob},
+            "ast": {"name": self.name},
+            "dataflow": {"name": self.name},
+            "tests": {"path": self.path, "symbol": self.symbol},
+        }
+        return {k: v for k, v in by_method.get(self.method, {}).items() if v is not None}
 
 
 class VerificationPlan(BaseModel):

@@ -157,15 +157,17 @@ A check that can only agree is not verification.
 
 Methods available:
 
-- `search` — regex across the repository. Args: {"pattern": str, "path_glob": str|null}.
+- `search` — regex across the repository. Set `pattern`, optionally `path_glob`.
   Proves a string is present or absent. Use for "is there a unique constraint", "does any
   other call site do X".
-- `ast` — resolve a definition and read its real signature and body.
-  Args: {"name": str}. Use to check what a called function actually does, whether a
-  parameter is optional, whether an `execute` call takes parameters.
-- `dataflow` — every real use of a symbol. Args: {"name": str}. Use to trace where a
-  value originates, or whether any caller passes None. Heuristic: no type inference.
-- `tests` — tests related to a file or symbol. Args: {"path": str} or {"symbol": str}.
+- `ast` — resolve a definition and read its real signature and body. Set `name`. Use to
+  check what a called function actually does, whether a parameter is optional, whether an
+  `execute` call takes parameters.
+- `dataflow` — every real use of a symbol. Set `name`. Use to trace where a value
+  originates, or whether any caller passes None. Heuristic: no type inference.
+- `tests` — tests related to a file or symbol. Set `path` or `symbol`.
+
+Set only the fields your chosen method uses; leave the rest null.
 
 Good checks are specific. `search` for `idempotency_key` is useful; `search` for `def` is
 not. Prefer two decisive checks over five vague ones.
@@ -299,8 +301,8 @@ async def _verify_file(
         return
 
     evidence_block = "\n".join(
-        f'<check method="{c.method}" rationale="{c.rationale}" args={json.dumps(c.args, sort_keys=True)}>\n'
-        f"{payload}\n</check>"
+        f'<check method="{c.method}" rationale="{c.rationale}" '
+        f"args={json.dumps(c.tool_args(), sort_keys=True)}>\n{payload}\n</check>"
         for c, _row, payload in executed
     )
 
@@ -392,14 +394,15 @@ async def _run_check(
         row.detail = f"unknown method {check.method}"
         return row, row.detail
 
-    key = f"{tool}:{json.dumps(check.args, sort_keys=True)}"
+    args = check.tool_args()
+    key = f"{tool}:{json.dumps(args, sort_keys=True)}"
     if key in cache:
         result.checks_cached += 1
         row.detail = cache[key][:2000]
         row.duration_ms = 0
         return row, cache[key]
 
-    outcome = await gateway.call("judge", tool, check.args)
+    outcome = await gateway.call("judge", tool, args)
     result.checks_run += 1
     payload = outcome.model_dump_json()[:6000]
     cache[key] = payload

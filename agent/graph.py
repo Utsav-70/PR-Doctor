@@ -164,7 +164,7 @@ async def plan_node(state: ReviewState) -> ReviewState:
     """Choose which specialists this change needs. Phase 6."""
     agents, plan, calls = await plan_review(state["pr"])
     state["agents"] = agents
-    state["focus"] = dict(plan.focus) if plan else {}
+    state["focus"] = plan.focus_map() if plan else {}
     state["plan_rationale"] = plan.rationale if plan else ""
     state.setdefault("usage", UsageAccumulator()).calls.extend(calls)
     if not agents:

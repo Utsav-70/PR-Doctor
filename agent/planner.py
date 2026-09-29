@@ -39,20 +39,32 @@ SECURITY_PATH_HINTS = re.compile(
 )
 
 
+class AgentFocus(BaseModel):
+    agent: AgentName
+    paths: list[str] = Field(
+        description="File paths from the diff, in the order this agent should read them"
+    )
+
+
 class ReviewPlan(BaseModel):
+    """The routing decision.
+
+    `focus` is a list rather than a `dict[agent, paths]`: a mapping renders as
+    `additionalProperties` in JSON Schema, which the Gemini Developer API rejects
+    outright. The list also pins the key to the `AgentName` literal, so the model cannot
+    invent an agent that does not exist.
+    """
+
     run_agents: list[AgentName] = Field(
         description="Which specialists this change actually needs. Omit the ones it does not."
     )
-    focus: dict[str, list[str]] = Field(
-        default_factory=dict,
-        description=(
-            "Agent name -> file paths in the order that agent should look at them. "
-            "Only paths from the diff."
-        ),
-    )
+    focus: list[AgentFocus] = Field(default_factory=list)
     rationale: str = Field(
         description="One or two sentences on why these agents and not the others"
     )
+
+    def focus_map(self) -> dict[str, list[str]]:
+        return {str(item.agent): item.paths for item in self.focus}
 
 
 PLANNER_PROMPT = """You route a pull request to code-review specialists. You do not review \

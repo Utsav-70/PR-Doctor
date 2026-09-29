@@ -120,6 +120,49 @@ def render_comment(finding: FindingSchema, review_id: str) -> str:
     return body
 
 
+# Skip reasons, as a developer would describe them. Anything unmapped falls back to the
+# raw reason rather than being dropped — an unnamed exclusion is still an exclusion.
+SKIP_REASON_LABEL: dict[str, str] = {
+    "budget": "over the diff-size budget",
+    "ignored_path": "on an ignored path",
+    "generated": "generated",
+    "binary": "binary",
+    "deleted": "deleted",
+    "no_patch": "no diff available",
+    "missing_at_head": "missing at this commit",
+    "path_not_allowed": "outside the repository",
+    "content_unavailable": "unreadable",
+    "category_documentation": "documentation",
+    "category_config": "configuration",
+    "category_data": "data",
+}
+
+
+def _coverage(pr: PullRequestContext) -> str:
+    """Every file that was not reviewed, grouped by why.
+
+    Counting only `budget` skips understated this badly: a 50-file PR with 25 reviewed
+    reported "9 were not analysed", because the other 16 were excluded for other reasons
+    and silently dropped out of the sentence. A partial-review warning that undercounts
+    what it missed is the exact failure it exists to prevent.
+    """
+    skipped = pr.skipped_files
+    head = f"Reviewed {len(pr.reviewed_files)} of {pr.changed_files} files."
+    if not skipped:
+        return head
+
+    by_reason: dict[str, int] = {}
+    for file in skipped:
+        by_reason[file.skip_reason or "unspecified"] = (
+            by_reason.get(file.skip_reason or "unspecified", 0) + 1
+        )
+    parts = [
+        f"{count} {SKIP_REASON_LABEL.get(reason, reason)}"
+        for reason, count in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return f"{head} The other {len(skipped)} were skipped: {', '.join(parts)}."
+
+
 def render_summary(
     pr: PullRequestContext,
     *,
@@ -142,14 +185,7 @@ def render_summary(
     ]
 
     if pr.is_partial:
-        skipped = [f for f in pr.skipped_files if f.skip_reason == "budget"]
-        detail = (
-            f"Reviewed {reviewed} of {pr.changed_files} files; "
-            f"{len(skipped)} {'was' if len(skipped) == 1 else 'were'} not analysed."
-            if skipped
-            else f"Reviewed {reviewed} of {pr.changed_files} files."
-        )
-        lines += ["", f"⚠️ **Partial review** ({pr.partial_reason or 'budget'}). {detail}"]
+        lines += ["", f"⚠️ **Partial review** ({pr.partial_reason or 'budget'}). {_coverage(pr)}"]
 
     if trimmed:
         lines += [

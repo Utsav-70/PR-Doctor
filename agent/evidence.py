@@ -172,6 +172,14 @@ Set only the fields your chosen method uses; leave the rest null.
 Good checks are specific. `search` for `idempotency_key` is useful; `search` for `def` is
 not. Prefer two decisive checks over five vague ones.
 
+**Do not plan a check that only re-reads the diff.** Searching for the very line the
+finding quotes confirms the premise, not the claim, and it comes back looking like
+evidence when it is not.
+
+**These checks see only this repository.** Third-party library source is not available. If
+a finding turns on what an external library does with its argument, no check here can
+settle it — plan nothing for it and let it be judged unverified.
+
 Return at most {max_checks} checks total across all findings."""
 
 
@@ -191,7 +199,22 @@ Refuting evidence is decisive. If a check shows the query is parameterised, the 
 over a literal, or the caller never passes None, say so and set confidence low.
 
 Empty output is not refutation by itself — a search that matched nothing may mean the \
-pattern was wrong. Say `inconclusive` in your reasoning when that is the honest read."""
+pattern was wrong. Say `inconclusive` in your reasoning when that is the honest read.
+
+## Two rules that decide most verdicts
+
+**Confirming the code says what the finding says it says is not support.** A finding \
+claiming `timeout=x * 1000` is a unit bug is not corroborated by a search that finds \
+`timeout=x * 1000`. That only confirms the premise, which was never in doubt. Support \
+means a check established the *defect* — that the value is wrong, that the caller passes \
+None, that the loop is unbounded. If every check merely re-read the diff, the honest \
+verdict is `verified: false` with confidence no higher than reported.
+
+**You can only see this repository.** Third-party library code is not available to these \
+checks. A claim that turns on what an external library does with its argument — what unit \
+it expects, what it raises, whether it retries — **cannot be verified here**. Say so, set \
+`verified: false`, and lower confidence: a claim about an unreadable contract, asserted \
+confidently, is where false positives come from."""
 
 
 async def verify_findings(

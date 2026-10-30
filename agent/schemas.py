@@ -85,6 +85,7 @@ class Check(BaseModel):
        Gemini Developer API refuses any schema containing it.
     """
 
+    finding_index: int = Field(description="Index of the finding this check is for", ge=0)
     method: CheckMethod
     rationale: str = Field(description="What this check would settle, in one sentence")
     pattern: str | None = Field(default=None, description="search: the regex to look for")
@@ -97,7 +98,9 @@ class Check(BaseModel):
         """The arguments this check's tool actually takes, dropping the unset ones."""
         by_method: dict[str, dict[str, Any]] = {
             "search": {"pattern": self.pattern, "path_glob": self.path_glob},
-            "ast": {"name": self.name},
+            # The body is the point of an `ast` check: a signature cannot show whether
+            # the query is parameterised or the read is bounded.
+            "ast": {"name": self.name, "include_body": True},
             "dataflow": {"name": self.name},
             "tests": {"path": self.path, "symbol": self.symbol},
         }
@@ -119,8 +122,14 @@ class EvidenceVerdict(BaseModel):
     verified: bool
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
-    supporting: list[str] = Field(default_factory=list)
-    refuting: list[str] = Field(default_factory=list)
+    # Check ids, not prose. Matching method names in prose marked every `search` row as
+    # refuting whenever the verdict said "the search found nothing".
+    supporting: list[int] = Field(
+        default_factory=list, description="ids of checks that established the defect"
+    )
+    refuting: list[int] = Field(
+        default_factory=list, description="ids of checks whose output disproves the claim"
+    )
 
 
 class EvidenceVerdicts(BaseModel):

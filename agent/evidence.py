@@ -83,6 +83,10 @@ class EvidenceRow:
     rationale: str = ""
     detail: str = ""
     duration_ms: int = 0
+    # Not persisted. `check_id` is what the verdict cites; `empty` means the tool ran
+    # and matched nothing, which can never refute (it may mean the pattern was wrong).
+    check_id: int = -1
+    empty: bool = False
 
 
 @dataclass
@@ -167,7 +171,9 @@ Methods available:
   originates, or whether any caller passes None. Heuristic: no type inference.
 - `tests` — tests related to a file or symbol. Set `path` or `symbol`.
 
-Set only the fields your chosen method uses; leave the rest null.
+Set `finding_index` to the finding the check is for. Set only the fields your chosen \
+method uses; leave the rest null. Names are bare or in-file (`neutralise`, \
+`Client.send`), not module paths.
 
 Good checks are specific. `search` for `idempotency_key` is useful; `search` for `def` is
 not. Prefer two decisive checks over five vague ones.
@@ -193,7 +199,9 @@ For each finding return:
 - `verified` — true only if a check positively confirmed the mechanism of the claim.
 - `confidence` — your honest probability the claim is real, given the evidence. Lower it
   when checks came back empty; a check that found nothing is weak evidence against.
-- `supporting` / `refuting` — which checks pointed which way, and what they showed.
+- `supporting` / `refuting` — the `id`s of the checks that pointed each way. Only cite \
+checks listed under this finding. A check that is neither goes in neither list. Say \
+what the checks showed in `reasoning`.
 
 Refuting evidence is decisive. If a check shows the query is parameterised, the loop runs \
 over a literal, or the caller never passes None, say so and set confidence low.
@@ -253,7 +261,7 @@ async def verify_findings(
     # Within one review the same check is often planned twice — two findings on adjacent
     # lines ask the same question. Keyed on (method, args), so the second asker pays
     # nothing.
-    cache: dict[str, str] = {}
+    cache: dict[str, tuple[str, bool]] = {}
 
     for path in sorted(by_file):
         if result.checks_run >= settings.MAX_VERIFICATION_CHECKS_PER_REVIEW:
@@ -289,7 +297,7 @@ async def _verify_file(
     gateway: ToolGateway,
     repository_block: str,
     result: VerificationResult,
-    cache: dict[str, str],
+    cache: dict[str, tuple[str, bool]],
 ) -> None:
     settings = get_settings()
     rendered = _render_findings(batch)
@@ -323,10 +331,12 @@ async def _verify_file(
             )
         return
 
+    indices = {index for index, _ in batch}
     evidence_block = "\n".join(
-        f'<check method="{c.method}" rationale="{c.rationale}" '
+        f'<check id="{n}" finding_index="{c.finding_index}" method="{c.method}" '
+        f'rationale="{c.rationale}" '
         f"args={json.dumps(c.tool_args(), sort_keys=True)}>\n{payload}\n</check>"
-        for c, _row, payload in executed
+        for n, (c, _row, payload) in enumerate(executed)
     )
 
     verdicts = await _call_structured(
@@ -337,10 +347,12 @@ async def _verify_file(
         result=result,
     )
 
-    indices = {index for index, _ in batch}
-    for _check, row, _payload in executed:
-        # A check settles every finding in its batch — they were planned together.
-        for index in sorted(indices):
+    for n, (check, row, _payload) in enumerate(executed):
+        # A check belongs to the finding it was planned for. Copying it to every finding
+        # in the file let one finding's evidence move another's confidence. A misnumbered
+        # check falls back to the whole batch rather than being lost.
+        targets = [check.finding_index] if check.finding_index in indices else sorted(indices)
+        for index in targets:
             result.rows.append(
                 EvidenceRow(
                     finding_index=index,
@@ -350,6 +362,8 @@ async def _verify_file(
                     rationale=row.rationale,
                     detail=row.detail,
                     duration_ms=row.duration_ms,
+                    check_id=n,
+                    empty=row.empty,
                 )
             )
 
@@ -364,30 +378,33 @@ async def _verify_file(
             continue
         # The verdict names which checks pointed which way; the rows carry the weights.
         # Fold them together so an outcome the model asserted has a weight behind it.
-        _apply_outcomes(result, verdict.finding_index, verdict.supporting, verdict.refuting)
         rows = [r for r in result.rows if r.finding_index == verdict.finding_index]
+        _apply_outcomes(rows, set(verdict.supporting), set(verdict.refuting))
         finding = next(f for i, f in batch if i == verdict.finding_index)
         adjusted = adjust_confidence(min(verdict.confidence, finding.confidence), rows)
         result.verdicts[verdict.finding_index] = (verdict.verified, adjusted, verdict.reasoning)
 
 
-def _apply_outcomes(
-    result: VerificationResult, index: int, supporting: list[str], refuting: list[str]
-) -> None:
-    """Mark each of this finding's evidence rows by what the verdict said about it.
+def _apply_outcomes(rows: list[EvidenceRow], supporting: set[int], refuting: set[int]) -> None:
+    """Mark one finding's evidence rows by the check ids the verdict cited.
 
-    Matched on the method name appearing in the verdict's own prose, which is loose — but
-    the alternative is asking the model to echo check IDs, which it does unreliably and
-    which fails silently when it gets one wrong.
+    Ids rather than method names in prose: prose matching marked every `search` row as
+    refuting whenever the verdict wrote "the search found nothing". A wrong id fails safe
+    — the row stays inconclusive and moves nothing.
+
+    Cited both ways means the model contradicted itself, so neither counts. An empty
+    result cannot refute: no match may only mean the pattern was wrong.
     """
-    support_text = " ".join(supporting).lower()
-    refute_text = " ".join(refuting).lower()
-    for row in result.rows:
-        if row.finding_index != index or row.outcome == "error":
+    for row in rows:
+        if row.outcome == "error":
             continue
-        if row.method in refute_text:
+        cited_for = row.check_id in supporting
+        cited_against = row.check_id in refuting
+        if cited_for and cited_against:
+            row.outcome = "inconclusive"
+        elif cited_against and not row.empty:
             row.outcome = "refutes"
-        elif row.method in support_text:
+        elif cited_for:
             row.outcome = "supports"
         else:
             row.outcome = "inconclusive"
@@ -398,7 +415,7 @@ async def _run_check(
     check: Check,
     *,
     gateway: ToolGateway,
-    cache: dict[str, str],
+    cache: dict[str, tuple[str, bool]],
     result: VerificationResult,
 ) -> tuple[EvidenceRow, str]:
     started = time.perf_counter()
@@ -421,14 +438,16 @@ async def _run_check(
     key = f"{tool}:{json.dumps(args, sort_keys=True)}"
     if key in cache:
         result.checks_cached += 1
-        row.detail = cache[key][:2000]
+        payload, row.empty = cache[key]
+        row.detail = payload[:2000]
         row.duration_ms = 0
-        return row, cache[key]
+        return row, payload
 
     outcome = await gateway.call("judge", tool, args)
     result.checks_run += 1
     payload = outcome.model_dump_json()[:6000]
-    cache[key] = payload
+    row.empty = outcome.ok and outcome.total == 0
+    cache[key] = (payload, row.empty)
     row.detail = payload[:2000]
     row.duration_ms = int((time.perf_counter() - started) * 1000)
     if not outcome.ok:

@@ -16,7 +16,6 @@ import json
 import logging
 import re
 import shutil
-from pathlib import Path
 from typing import Any
 
 from agent.tools.results import FileLine, SearchMatch, ToolResult
@@ -75,7 +74,10 @@ async def search_code(
     ]
     if path_glob:
         args += ["--glob", path_glob]
-    args += ["-e", pattern, str(workspace.root)]
+    # Search "." from inside the root, not the absolute root: ripgrep matches a glob
+    # against the path as it walks it, so `agent/*.py` never matches `/tmp/x/agent/a.py`
+    # and every anchored glob silently returns nothing.
+    args += ["-e", pattern, "."]
 
     if shutil.which("rg") is None:
         # Degrade rather than fail. ripgrep is the right tool and the deployment should
@@ -86,7 +88,10 @@ async def search_code(
 
     try:
         process = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *args,
+            cwd=str(workspace.root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         out, _ = await asyncio.wait_for(process.communicate(), timeout=RIPGREP_TIMEOUT_SECONDS)
     except TimeoutError:
@@ -175,7 +180,8 @@ def _parse_ripgrep_json(
 def _rel(payload: dict[str, Any], workspace: Workspace) -> str:
     absolute = (payload.get("path") or {}).get("text", "")
     try:
-        return workspace.relative(Path(absolute))
+        # ripgrep reports `./agent/x.py`; anchor it to the root, not the worker's cwd.
+        return workspace.relative(workspace.root / absolute)
     except ValueError:
         return absolute
 

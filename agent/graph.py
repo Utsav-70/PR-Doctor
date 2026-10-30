@@ -307,8 +307,12 @@ async def verify_node(state: ReviewState) -> ReviewState:
     state["agreement"] = agreement
 
     try:
+        # The diff goes too: without it the verifier is asked about code it cannot see,
+        # and every claim about a changed function comes back "cannot verify".
         result = await verify_findings(
-            kept, gateway=gateway, repository_block=bundle.repository_block
+            kept,
+            gateway=gateway,
+            repository_block=f"{bundle.repository_block}\n{bundle.diff_block}",
         )
     except Exception as exc:
         logger.exception("verification failed")
@@ -351,7 +355,7 @@ async def judge_node(state: ReviewState) -> ReviewState:
             verdicts=state.get("verdicts", {}),
             agreement=state.get("agreement", {}),
             agents=state.get("finding_agents"),
-            repository_block=bundle.repository_block,
+            repository_block=f"{bundle.repository_block}\n{bundle.diff_block}",
             already_posted_keys=state.get("already_posted_keys", set()),
         )
     except Exception as exc:

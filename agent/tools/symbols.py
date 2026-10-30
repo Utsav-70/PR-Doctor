@@ -165,7 +165,9 @@ def get_symbol(
             if node_kind == "import":
                 if name not in qualified:
                     continue
-            elif simple != name and qualified != name:
+            # Models send module-dotted names (`agent.reviewer._budget`); `qualified` is
+            # only in-file (`Class.method`), so accept it as a suffix too.
+            elif simple != name and qualified != name and not name.endswith(f".{qualified}"):
                 continue
             if kind and node_kind != kind:
                 continue
@@ -272,6 +274,9 @@ async def find_references(
     """
     if not name.strip():
         return ToolResult.failure(REFERENCE_TOOL, "empty symbol name")
+    # References are matched per identifier node, so `agent.reviewer.foo` can only ever
+    # mean `foo`. Without this a dotted name matches nothing, silently.
+    name = name.rsplit(".", 1)[-1]
 
     from agent.tools.search import search_code
 

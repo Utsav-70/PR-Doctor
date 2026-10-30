@@ -22,11 +22,30 @@ alembic==1.19.2
 psycopg[binary]==3.3.5             # psycopg 3 — drives postgresql+psycopg:// async
 
 # --- config / validation -------------------------------------------------------
+# gitignore semantics for ignore globs. fnmatch cannot express them: it treats
+# `**/migrations/**` as requiring a leading directory, so a top-level `migrations/`
+# escaped the ignore list entirely.
+pathspec==1.1.1
 pydantic==2.13.5
 pydantic-settings==2.15.0
 
+# --- pipeline ------------------------------------------------------------------
+# Typed graph state plus the checkpointer Phase 13 needs. Not used for branching —
+# the Phase 5 graph is linear — but Phase 6's fan-out lands on the same shape.
+langgraph==1.2.11
+
 # --- LLM -----------------------------------------------------------------------
+# Both providers ship; LLM_PROVIDER picks one at runtime. Imports are function-local
+# in agent/reviewer.py, so the unused SDK is never loaded.
 anthropic==1.4.0                   # messages.parse() structured output + effort
+google-genai==2.23.0               # Gemini fallback provider
+
+# --- code intelligence (Phase 4) -------------------------------------------------
+# Tree-sitter parses partially through syntax errors, which matters because the file
+# under review is often the broken one. The grammar package is separate from the
+# runtime and both must move together.
+tree-sitter==0.26.0
+tree-sitter-python==0.25.0
 
 # --- GitHub --------------------------------------------------------------------
 httpx==0.28.1

@@ -11,6 +11,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Phase 4 shells out to both of these, and python:3.12-slim ships neither:
+#   git      — the shallow checkout the code-intelligence tools read from
+#   ripgrep  — search_code. There is a Python fallback, but it is ~10x slower and
+#              does not honour .gitignore, so the image should carry the real thing.
+# Installed before the pip layer because this list changes far less often than
+# requirements.txt.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y git ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy requirements alone first so a source change does not invalidate the pip layer.
 COPY requirements.txt ./
 RUN pip install -r requirements.txt

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Any, Self
 
@@ -21,6 +23,44 @@ logger = logging.getLogger(__name__)
 
 RETRY_STATUS = frozenset({500, 502, 503, 504})
 MAX_ATTEMPTS = 3
+
+# GitHub signals a rate limit as 403 (historically) or 429 (increasingly). Both carry
+# Retry-After on a secondary limit, so both must take the same path — treating 429 as a
+# plain error was how a retryable pause became a failed review.
+RATE_LIMIT_STATUS = frozenset({403, 429})
+
+# Cap on a single honoured sleep. Beyond this the task should die and let Celery's
+# backoff reschedule it, rather than hold a worker slot idle.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse Retry-After, which is either delta-seconds or an HTTP-date.
+
+    GitHub sends seconds, but the header is specified both ways and a ValueError here
+    would turn a polite backoff into a crash.
+    """
+    if not value:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - datetime.now(UTC)).total_seconds(), 0.0)
+
+
+def _seconds_until_epoch(value: str) -> float | None:
+    """How long until an x-ratelimit-reset epoch. Logging only."""
+    try:
+        return max(float(value) - datetime.now(UTC).timestamp(), 0.0)
+    except ValueError:
+        return None
 
 
 class GitHubError(RuntimeError):
@@ -80,35 +120,68 @@ class GitHubClient:
         *,
         accept: str | None = None,
         params: dict[str, Any] | None = None,
+        json: Any = None,
     ) -> httpx.Response:
         """One request with retries on 5xx and rate limits.
 
         Secondary rate limits send `Retry-After` and must be honoured exactly —
         ignoring them escalates to an App-wide block, not just a slower response.
+
+        **Retries are for GET only.** A 502 on `POST /pulls/{n}/reviews` does not say
+        whether the review was created — GitHub may have applied it and failed on the
+        way back. Retrying that posts the review twice, which is developer-visible and
+        cannot be undone. An unposted review is recoverable; a double-posted one is not.
         """
         headers = {"Accept": accept} if accept else None
         last_error: Exception | None = None
+        idempotent = method.upper() in {"GET", "HEAD"}
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = await self._client.request(method, url, headers=headers, params=params)
+                response = await self._client.request(
+                    method, url, headers=headers, params=params, json=json
+                )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
+                if not idempotent:
+                    # The request may have reached GitHub. Fail rather than guess.
+                    raise GitHubError(f"{method} {url} failed in transit: {exc}") from exc
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
-            if response.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS:
+            if response.status_code in RETRY_STATUS and idempotent and attempt < MAX_ATTEMPTS:
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
-            retry_after = response.headers.get("retry-after")
-            if response.status_code == 403 and retry_after and attempt < MAX_ATTEMPTS:
-                logger.warning("secondary rate limit; sleeping %ss", retry_after)
-                await asyncio.sleep(min(float(retry_after), 60.0))
-                continue
+            if response.status_code in RATE_LIMIT_STATUS:
+                delay = _retry_after_seconds(response.headers.get("retry-after"))
+                if delay is not None and attempt < MAX_ATTEMPTS:
+                    logger.warning(
+                        "secondary rate limit; sleeping",
+                        extra={
+                            "status": response.status_code,
+                            "retry_after": delay,
+                            "attempt": attempt,
+                            "url": url,
+                        },
+                    )
+                    await asyncio.sleep(min(delay, MAX_RETRY_AFTER_SECONDS))
+                    continue
 
-            if response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0":
-                raise GitHubError("primary rate limit exhausted", 403)
+                if response.headers.get("x-ratelimit-remaining") == "0":
+                    # Primary limit. The reset can be up to an hour out, so do not
+                    # sleep on it — fail and let Celery's backoff reschedule.
+                    reset = response.headers.get("x-ratelimit-reset", "")
+                    logger.warning(
+                        "primary rate limit exhausted",
+                        extra={
+                            "status": response.status_code,
+                            "reset_epoch": reset,
+                            "resets_in_seconds": _seconds_until_epoch(reset),
+                            "url": url,
+                        },
+                    )
+                    raise GitHubError("primary rate limit exhausted", response.status_code)
 
             return response
 
@@ -191,3 +264,68 @@ class GitHubClient:
                 f"fetching diff failed: HTTP {response.status_code}", response.status_code
             )
         return response.text
+
+    async def list_review_comments(
+        self, owner: str, repo: str, number: int, review_id: int
+    ) -> list[dict[str, Any]]:
+        """Inline comments belonging to one review.
+
+        The create-review response carries the review, not its comments, so the comment
+        IDs needed to trace a finding to what a developer actually sees come from here.
+        """
+        response = await self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments",
+            params={"per_page": 100},
+        )
+        if response.status_code >= 400:
+            # Not fatal: the review is already posted. Losing the IDs costs traceability,
+            # not correctness, and raising here would mark a successful post as failed.
+            logger.warning(
+                "could not list review comments",
+                extra={"status": response.status_code, "review_id": review_id},
+            )
+            return []
+        return list(response.json())
+
+    async def create_review(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        commit_id: str,
+        body: str,
+        comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Post one review carrying every inline comment.
+
+        One request, not one per comment. N separate calls send N notifications to
+        everyone watching the PR, cost N rate-limit units, and can fail halfway leaving
+        a partial review that cannot be cleanly retried.
+
+        `commit_id` is mandatory: without it GitHub anchors the comments to whatever the
+        latest commit is by the time the request lands, which may not be the commit that
+        was reviewed.
+
+        `event` is always COMMENT. REQUEST_CHANGES would make one false positive block a
+        release, which is how a review bot gets uninstalled.
+        """
+        response = await self._request(
+            "POST",
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews",
+            json={
+                "commit_id": commit_id,
+                "event": "COMMENT",
+                "body": body,
+                "comments": comments,
+            },
+        )
+        if response.status_code >= 400:
+            # 422 is the anchoring failure: a position that is not in the diff. The
+            # body names the offending comment, so it is worth keeping.
+            raise GitHubError(
+                f"posting review failed: HTTP {response.status_code}: {response.text[:500]}",
+                response.status_code,
+            )
+        return dict(response.json())
